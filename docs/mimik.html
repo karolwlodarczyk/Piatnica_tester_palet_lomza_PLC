@@ -1,0 +1,1051 @@
+<title>Mimik testera palet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --bg:#E8EDF0; --panel:#FFFFFF; --panel-2:#F4F7F9;
+  --ink:#131E26; --ink-2:#4C616F; --ink-3:#7C919E;
+  --line:#C4D2DA; --line-2:#DCE6EB;
+  --accent:#2F6E96; --accent-soft:#DCEAF3;
+  --ok:#2E9E52; --no:#C8402F; --no-dim:#F0C6BF; --warn:#C97F16;
+  --wood:#B9863F; --wood-dark:#8A6329; --stack:#6E5127;
+  --shadow:0 1px 2px rgba(19,30,38,.10), 0 6px 18px rgba(19,30,38,.06);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0D1418; --panel:#151F25; --panel-2:#1B272E;
+    --ink:#E2ECF1; --ink-2:#9BB0BC; --ink-3:#6E8592;
+    --line:#2B3B45; --line-2:#223038;
+    --accent:#5CA3CD; --accent-soft:#1B333F;
+    --ok:#46BE6C; --no:#E2604C; --no-dim:#4A211A; --warn:#E0A040;
+    --wood:#C08F49; --wood-dark:#8E6931; --stack:#7B5C2E;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.28);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0D1418; --panel:#151F25; --panel-2:#1B272E;
+  --ink:#E2ECF1; --ink-2:#9BB0BC; --ink-3:#6E8592;
+  --line:#2B3B45; --line-2:#223038;
+  --accent:#5CA3CD; --accent-soft:#1B333F;
+  --ok:#46BE6C; --no:#E2604C; --no-dim:#4A211A; --warn:#E0A040;
+  --wood:#C08F49; --wood-dark:#8E6931; --stack:#7B5C2E;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.28);
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:14px;line-height:1.45}
+.wrap{max-width:1460px;margin:0 auto;padding:22px 20px 48px}
+
+header.top{display:flex;align-items:flex-end;justify-content:space-between;
+  gap:24px;flex-wrap:wrap;padding-bottom:14px;margin-bottom:16px;
+  border-bottom:2px solid var(--line)}
+h1{font-family:"Barlow Condensed",Impact,sans-serif;font-weight:700;
+  font-size:34px;letter-spacing:.02em;margin:0;line-height:1;text-transform:uppercase}
+.sub{color:var(--ink-2);margin:6px 0 0;max-width:70ch}
+.clock{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--ink-3);
+  text-align:right;font-variant-numeric:tabular-nums}
+.clock b{display:block;font-size:22px;color:var(--ink);font-weight:600}
+
+.console{display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+  background:var(--panel);border:1px solid var(--line);border-radius:4px;
+  padding:11px 14px;margin-bottom:14px;box-shadow:var(--shadow)}
+.grp{display:flex;align-items:center;gap:8px}
+.grp + .grp{border-left:1px solid var(--line-2);padding-left:12px}
+.lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;
+  color:var(--ink-3);font-weight:600}
+button{font-family:inherit;font-size:13px;font-weight:500;color:var(--ink);
+  background:var(--panel-2);border:1px solid var(--line);border-radius:3px;
+  padding:7px 13px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+button.on:hover{color:#fff}
+button.stop{background:var(--no);border-color:var(--no);color:#fff;
+  font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+button.stop:hover{color:#fff;filter:brightness(1.08)}
+button.stop.armed{background:var(--panel-2);color:var(--no);border-color:var(--no)}
+button.mono{font-family:"IBM Plex Mono",monospace;font-size:11.5px;padding:5px 9px}
+input[type=range]{width:104px;accent-color:var(--accent)}
+.val{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--ink-2);
+  min-width:42px;font-variant-numeric:tabular-nums}
+
+.mimic{background:var(--panel);border:1px solid var(--line);border-radius:4px;
+  padding:16px;margin-bottom:14px;box-shadow:var(--shadow);overflow-x:auto}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(110px,1fr));
+  gap:10px 16px;min-width:1560px}
+.st{position:relative;background:var(--panel-2);border:1px solid var(--line);
+  border-radius:3px;padding:7px 8px 8px;cursor:pointer;
+  display:flex;flex-direction:column;gap:5px;min-height:108px}
+.st:hover{border-color:var(--accent)}
+.st.sel{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.st.busy{background:var(--accent-soft)}
+.st.hold{border-color:var(--warn)}
+.st-hd{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.st-no{font-family:"Barlow Condensed",sans-serif;font-weight:700;font-size:19px;
+  line-height:1;color:var(--accent)}
+.st-nm{font-family:"Barlow Condensed",sans-serif;font-weight:600;font-size:12.5px;
+  line-height:1.1;text-transform:uppercase;letter-spacing:.01em;
+  color:var(--ink);min-height:2.2em}
+.rev{font-family:"IBM Plex Mono",monospace;font-size:9px;color:var(--warn);
+  border:1px solid var(--warn);border-radius:2px;padding:0 3px;line-height:1.4}
+.belt{position:relative;height:22px;border-radius:2px;
+  background:repeating-linear-gradient(90deg,var(--line-2) 0 2px,transparent 2px 9px),var(--panel);
+  border:1px solid var(--line-2);overflow:hidden}
+.pal{position:absolute;top:2px;height:16px;width:34%;background:var(--wood);
+  border:1px solid var(--wood-dark);border-radius:1px}
+.pal.nok{background:var(--no);border-color:var(--no)}
+.pal.stack{background:var(--stack);border-color:#000}
+.pal-n{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-family:"IBM Plex Mono",monospace;font-size:9px;color:#fff;font-weight:600}
+.sens{display:flex;gap:9px;align-items:center;min-height:14px}
+.led{display:flex;align-items:center;gap:4px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--no);
+  border:1px solid rgba(0,0,0,.25);flex:0 0 auto}
+.dot.on{background:var(--ok)}
+.dot.off{background:var(--no)}
+.dot.dis{background:var(--ink-3);opacity:.4}
+.led span{font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--ink-3)}
+.state{font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--ink-2);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.state b{color:var(--ink);font-weight:600}
+.arrow{position:absolute;color:var(--ink-3);font-size:15px;line-height:1;pointer-events:none}
+.arrow.r{right:-11px;top:50%;transform:translateY(-50%)}
+.arrow.d{left:50%;bottom:-13px;transform:translateX(-50%)}
+.arrow.u{right:-11px;top:-2px}
+
+.cols{display:grid;grid-template-columns:1.25fr 1fr;gap:14px;align-items:start}
+@media (max-width:1040px){.cols{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:4px;
+  box-shadow:var(--shadow);margin-bottom:14px}
+.card h2{font-family:"Barlow Condensed",sans-serif;font-weight:600;font-size:16px;
+  text-transform:uppercase;letter-spacing:.05em;margin:0;padding:10px 14px;
+  border-bottom:1px solid var(--line-2);display:flex;justify-content:space-between;
+  align-items:center;gap:10px;flex-wrap:wrap}
+.card h2 em{font-style:normal;font-family:"IBM Plex Mono",monospace;font-size:11px;
+  color:var(--ink-3);letter-spacing:0;text-transform:none}
+.card .body{padding:12px 14px}
+.tabs{display:flex;gap:5px;flex-wrap:wrap}
+.tabs button{padding:4px 9px;font-size:12px}
+
+.cyl{display:grid;grid-template-columns:14px 1fr 78px 46px;gap:9px;align-items:center;
+  padding:5px 0;border-bottom:1px solid var(--line-2)}
+.cyl:last-child{border-bottom:none}
+.cyl-nm{font-size:12.5px}
+.cyl-nm small{color:var(--ink-3);font-family:"IBM Plex Mono",monospace;font-size:10px}
+.bar{position:relative;height:9px;border-radius:2px;background:var(--panel-2);
+  border:1px solid var(--line-2);overflow:hidden}
+.bar i{position:absolute;left:0;top:0;bottom:0;display:block;background:var(--ink-3)}
+.bar i.ext{background:var(--ok)}
+.bar i.ret{background:var(--no)}
+.pos{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-2);
+  text-align:right;font-variant-numeric:tabular-nums}
+
+/* wózek desztaplarki / sztaplarki */
+.lift{position:relative;height:30px;border-radius:2px;background:var(--panel-2);
+  border:1px solid var(--line-2);margin:6px 0 22px}
+.lift .car{position:absolute;top:3px;height:22px;width:12px;background:var(--accent);
+  border-radius:1px;transform:translateX(-50%)}
+.lift .mk{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ink-3)}
+.lift .mk b{position:absolute;top:34px;left:50%;transform:translateX(-50%);
+  font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--ink-3);
+  font-weight:500;white-space:nowrap}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;
+  font-family:"IBM Plex Mono",monospace;font-size:11.5px;margin-top:14px}
+.kv span{color:var(--ink-3)}
+.kv b{font-weight:600;font-variant-numeric:tabular-nums}
+
+/* bity MAIN */
+.bits{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px}
+.bit{display:flex;align-items:center;gap:7px;padding:4px 7px;border-radius:3px;
+  background:var(--panel-2);border:1px solid var(--line-2);
+  font-family:"IBM Plex Mono",monospace;font-size:11px}
+.bit span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bit.cmd{cursor:pointer}
+.bit.cmd:hover{border-color:var(--accent)}
+
+.log{font-family:"IBM Plex Mono",monospace;font-size:11.5px;max-height:210px;overflow-y:auto}
+.log div{padding:3px 0;border-bottom:1px solid var(--line-2);display:flex;gap:8px}
+.log div:last-child{border-bottom:none}
+.log time{color:var(--ink-3);flex:0 0 50px;font-variant-numeric:tabular-nums}
+.log b{flex:0 0 30px;color:var(--accent);font-weight:600}
+.log span.nok{color:var(--no)}
+.log span.ok{color:var(--ok)}
+
+.counters{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:12px}
+.counter{display:flex;flex-direction:column;gap:1px}
+.counter b{font-family:"Barlow Condensed",sans-serif;font-size:26px;line-height:1;
+  font-variant-numeric:tabular-nums}
+.counter span{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3)}
+.counter.ok b{color:var(--ok)}
+.counter.nok b{color:var(--no)}
+
+.legend{display:flex;flex-wrap:wrap;gap:12px 22px;padding:11px 14px;
+  background:var(--panel);border:1px solid var(--line);border-radius:4px;
+  font-size:12px;color:var(--ink-2)}
+.legend div{display:flex;align-items:center;gap:6px}
+.sw{width:11px;height:11px;border-radius:50%;flex:0 0 auto}
+.sw.sq{border-radius:2px;width:16px;height:10px}
+</style>
+
+<div class="wrap">
+
+<header class="top">
+  <div>
+    <h1>Tester palet — mimik</h1>
+    <p class="sub">Wersja uruchomieniowa. Odwzorowuje algorytm testowy z <code>MAIN</code>:
+      czujniki w logice wprost, stacje bez czujników na czasówkach, siłowniki
+      potwierdzane czasem, falowniki 15 Hz, co piąta paleta NOK.</p>
+  </div>
+  <div class="clock"><b id="clk">00:00</b>cykl 50 ms</div>
+</header>
+
+<div class="console">
+  <div class="grp">
+    <button id="btnRun" class="on">Stop</button>
+    <button id="btnEstop" class="stop">Grzybek</button>
+  </div>
+  <div class="grp">
+    <span class="lbl">Tempo</span>
+    <input type="range" id="spd" min="1" max="60" value="20">
+    <span class="val" id="spdV">2,0×</span>
+  </div>
+  <div class="grp">
+    <span class="lbl">Sztaplarka</span>
+    <button id="btnStk11" class="on">Włączona</button>
+  </div>
+  <div class="grp">
+    <span class="lbl">Palet w stosie</span>
+    <input type="range" id="stk" min="2" max="15" value="15">
+    <span class="val" id="stkV">15</span>
+  </div>
+</div>
+
+<div class="mimic"><div class="grid" id="grid"></div></div>
+
+<div class="card">
+  <h2><span>Bity MAIN</span><em>klikalne — komendy operatora; reszta pokazuje stan</em></h2>
+  <div class="body"><div class="bits" id="bits"></div></div>
+</div>
+
+<div class="cols">
+  <div>
+    <div class="card">
+      <h2>
+        <span>Mechanika stacji</span>
+        <span class="tabs">
+          <button data-tab="3">3 — desztaplarka</button>
+          <button data-tab="4" class="on">4 — ściskanie</button>
+          <button data-tab="5">5 — rozrywanie</button>
+          <button data-tab="11">11 — sztaplarka</button>
+        </span>
+      </h2>
+      <div class="body" id="mech"></div>
+    </div>
+
+    <div class="legend">
+      <div><span class="sw" style="background:var(--ok)"></span> czujnik widzi paletę</div>
+      <div><span class="sw" style="background:var(--no)"></span> czujnik nie widzi palety</div>
+      <div><span class="sw" style="background:var(--ink-3);opacity:.4"></span> czujnika nie ma</div>
+      <div><span class="sw sq" style="background:var(--ok)"></span> siłownik wysuwa się / wysunięty</div>
+      <div><span class="sw sq" style="background:var(--no)"></span> siłownik cofa się / wycofany</div>
+      <div><span class="sw sq" style="background:var(--wood)"></span> paleta dobra</div>
+      <div><span class="sw sq" style="background:var(--no)"></span> paleta odrzucona</div>
+      <div><span class="sw sq" style="background:var(--stack)"></span> stos palet</div>
+      <div><span style="color:var(--warn);font-family:monospace;font-size:11px;border:1px solid var(--warn);padding:0 3px">REV</span> odwrócony kierunek silnika</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span>Dziennik</span><em id="thru">0 palet</em></h2>
+    <div class="body">
+      <div class="counters">
+        <div class="counter ok"><b id="cOk">0</b><span>Dobre</span></div>
+        <div class="counter nok"><b id="cNok">0</b><span>Odrzut</span></div>
+        <div class="counter"><b id="cWip">0</b><span>W maszynie</span></div>
+        <div class="counter"><b id="cSt3">0</b><span>Stos na 3</span></div>
+        <div class="counter"><b id="cSt11">0</b><span>Na szczękach 11</span></div>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+"use strict";
+
+/* =======================================================================
+   ALGORYTM TESTOWY - odwzorowanie MAIN
+   ======================================================================= */
+
+const S = { EMPTY:'PUSTY', INFEED:'WJAZD', STOPDLY:'CZASÓWKA', OCCUPIED:'ZAJĘTY',
+            BUSY:'OPERACJA', OUTFEED:'WYJAZD' };
+
+// sens: liczba czujnikow, t: czas przejazdu [s], inv: odwrocony kierunek
+const DEF = [
+  {id:1,  nm:'Załadunek stosów', col:1, row:2, next:2,  kind:'buf',     sens:0, t:4, inv:true},
+  {id:2,  nm:'Bufor stosów',     col:2, row:2, next:3,  kind:'buf',     sens:0, t:5},
+  {id:3,  nm:'Desztaplarka',     col:3, row:2, next:4,  kind:'destack', sens:1, t:3},
+  {id:4,  nm:'Test ściskania',   col:4, row:2, next:5,  kind:'press',   sens:2, t:6},
+  {id:5,  nm:'Test rozrywania',  col:5, row:2, next:6,  kind:'tear',    sens:0, t:5, inv:true},
+  {id:6,  nm:'Pomiar laserowy',  col:6, row:2, next:7,  kind:'buf',     sens:0, t:5, inv:true},
+  {id:7,  nm:'Etykietowanie',    col:7, row:2, next:8,  kind:'buf',     sens:1, t:3, inv:true},
+  {id:8,  nm:'Rozjazd',          col:8, row:2, next:11, kind:'divert',  sens:0, t:5, inv:true},
+
+  {id:11, nm:'Sztaplarka',       col:9, row:1, next:12, kind:'stack',   sens:1, t:3},
+  {id:12, nm:'Bufor stosów',     col:10,row:1, next:13, kind:'buf',     sens:0, t:5},
+  {id:13, nm:'Wyjście dobrych',  col:11,row:1, next:0,  kind:'pickup',  sens:1, t:3},
+
+  {id:9,  nm:'Transp. łańcuch.', col:8, row:3, next:10, kind:'chain',   sens:0, t:6, inv:true},
+  {id:10, nm:'Przekierowanie',   col:9, row:3, next:14, kind:'buf',     sens:0, t:5},
+  {id:14, nm:'Bufor odrzutu',    col:10,row:3, next:15, kind:'buf',     sens:0, t:5, inv:true},
+  {id:15, nm:'Bufor odrzutu',    col:11,row:3, next:16, kind:'buf',     sens:0, t:5, inv:true},
+  {id:16, nm:'Odbiór odrzutu',   col:12,row:3, next:0,  kind:'pickup',  sens:1, t:3, inv:true}
+];
+
+// Nazwy diod czujnikow
+const SENSNM = { 4:['WEJ','STOP'] };
+
+/* --- stacja 4: trzy grupy zaworow --- */
+const GRP4 = [
+  {k:'up', nm:'Górne szerokie', io:'OUTPUTS[7] / [2]'},
+  {k:'up', nm:'Górne wąskie',   io:'OUTPUTS[5] / [6]'},
+  {k:'lo', nm:'Dolne',          io:'OUTPUTS[4] / [3]'}
+];
+
+/* --- stacja 5 --- */
+const CYL5 = [
+  {id:'block', nm:'Blokada punktu zatrzymania', io:'FestoValves_1[6,1] / [6,2]'},
+  {id:'lift',  nm:'Podnoszenie szczęk',         io:'FestoValves_1[7,1] / [7,2]'},
+  {id:'jaw1',  nm:'Szczęki lewe',               io:'FestoValves_1[1,1]'},
+  {id:'jaw2',  nm:'Szczęki środkowe',           io:'FestoValves_1[2,1]'},
+  {id:'jaw3',  nm:'Szczęki prawe',              io:'FestoValves_1[3,1]'},
+  {id:'pull1', nm:'Rozrywający 1',              io:'FestoValves_2[4,2] / [4,1]'},
+  {id:'pull2', nm:'Rozrywający 2',              io:'FestoValves_2[3,2] / [3,1]'},
+  {id:'pull3', nm:'Rozrywający 3',              io:'FestoValves_2[1,2] / [1,1]'},
+  {id:'pull4', nm:'Rozrywający 4',              io:'FestoValves_2[2,2] / [2,1]'},
+  {id:'pull5', nm:'Rozrywający 5',              io:'FestoValves_2[5,2] / [5,1]'},
+  {id:'pull6', nm:'Rozrywający 6',              io:'FestoValves_2[6,2] / [6,1]'}
+];
+
+/* --- pozycje wozkow, tak jak w ACT_Config --- */
+const LIFT3  = { bottom:1000, middle:2000, top:3000 };
+const LIFT11 = { bottom:5000, middle:6000, top:7000 };
+
+/* ---------- siłownik na czasówce ---------- */
+function Cyl(nm, io, sec){
+  return { nm, io, pos:0, tgt:0, sec:sec||3, moving:0 };
+}
+function cylStep(c, dt){
+  const before = c.pos, v = 1 / c.sec;
+  if(c.pos < c.tgt) c.pos = Math.min(c.tgt, c.pos + v*dt);
+  else if(c.pos > c.tgt) c.pos = Math.max(c.tgt, c.pos - v*dt);
+  c.moving = (c.pos - before) > 1e-9 ? 1 : ((before - c.pos) > 1e-9 ? -1 : 0);
+}
+const cOut  = c => c.pos >= 0.999;
+const cBack = c => c.pos <= 0.001;
+
+/* ---------- wózek ---------- */
+function Lift(p, jawSec){
+  return { p, pos:p.bottom, tgt:p.bottom, sel:1, v:900,
+           jaw:Cyl('Szczęki','', jawSec), inPos:true };
+}
+function liftStep(L, dt){
+  const d = L.tgt - L.pos;
+  if(Math.abs(d) <= 20){ L.pos = L.tgt; L.inPos = true; }
+  else { L.pos += Math.sign(d) * Math.min(Math.abs(d), L.v * dt); L.inPos = false; }
+  cylStep(L.jaw, dt);
+}
+function liftTo(L, sel){
+  if(L.sel !== sel){ L.sel = sel; L.inPos = false; }
+  L.tgt = sel === 1 ? L.p.bottom : (sel === 2 ? L.p.middle : L.p.top);
+  return L.inPos;
+}
+
+/* ---------- stan globalny ---------- */
+let nodes = {}, order = [], SEQ = 1;
+let running = true, estop = false, speed = 2.0, stackSize = 15;
+let simT = 0, cOkN = 0, cNokN = 0, thru = 0, nDone = 0;
+let log = [], tab = 4;
+
+// bity MAIN
+let bit = { transferEnable:true, stacker11:true };
+
+function say(st, msg, cls){
+  log.unshift({t:simT, st, msg, cls:cls||''});
+  if(log.length > 60) log.pop();
+}
+
+function Node(d){
+  return { ...d, state:S.EMPTY, wait:'brak ładunku', load:null, p:0,
+           opDone:false, step:0, t:0, hold:0 };
+}
+
+function build(){
+  nodes = {}; order = [];
+  DEF.forEach(d => { nodes[d.id] = Node(d); order.push(d.id); });
+
+  const n4 = nodes[4];
+  n4.cyl = GRP4.map(g => Cyl(g.nm, g.io, 1));
+  n4.rollers = false;
+
+  const n5 = nodes[5];
+  n5.cyl = {};
+  CYL5.forEach(c => { n5.cyl[c.id] = Cyl(c.nm, c.io, 3); });
+
+  nodes[3].lift  = Lift(LIFT3, 5);
+  nodes[3].remaining = 0;
+  nodes[11].lift = Lift(LIFT11, 5);
+  nodes[11].held = 0;
+  nodes[11].lift.jaw.pos = 0;
+}
+build();
+
+function newPallet(){ return { id:SEQ++, nok:false, stack:false, n:1 }; }
+function newStack(n){ return { id:SEQ++, nok:false, stack:true, n:n }; }
+
+/* =======================================================================
+   CZUJNIKI - logika wprost, 1 = jest paleta
+   ======================================================================= */
+function sensors(n){
+  if(n.sens === 0 || !n.load) return [false,false];
+  if(n.sens === 1) return [n.p >= 0.90 && n.p < 1.20, false];
+  // stacja 4: czujnik wjazdu i czujnik pozycji koncowej
+  return [n.p >= 0.30 && n.p < 1.20, n.p >= 0.90 && n.p < 1.15];
+}
+const arrived = n => (n.sens === 0) ? n.p >= 1 : sensors(n)[n.sens === 2 ? 1 : 0];
+
+/* =======================================================================
+   UZGADNIANIE PRZEJAZDU
+   ======================================================================= */
+function why(n){
+  if(!n) return 'brak następnika';
+  if(estop) return 'brak zezwolenia';
+  if(n.load) return 'następnik zajęty';
+  if(n.state !== S.EMPTY) return 'następnik niegotowy';
+  if(n.kind === 'tear'){
+    const c = n.cyl;
+    if(!(cBack(c.jaw1) && cBack(c.jaw2) && cBack(c.jaw3) && cBack(c.lift))) return 'mechanika 5';
+    if(![1,2,3,4,5,6].every(i => cBack(c['pull'+i]))) return 'mechanika 5';
+  }
+  if(n.kind === 'stack' && bit.stacker11){
+    if(n.lift.sel !== 3 || !n.lift.inPos) return 'wózek 11 nie w górze';
+    if(n.held > 0 && !cOut(n.lift.jaw)) return 'szczęki 11 otwarte';
+  }
+  return '';
+}
+const canAccept = n => why(n) === '';
+
+function nextOf(n){
+  if(n.kind === 'divert') return nodes[n.load && n.load.nok ? 9 : 11];
+  return nodes[n.next] || null;
+}
+
+function beginInfeed(dst, load){
+  dst.load = load; dst.p = 0; dst.opDone = false; dst.step = 0; dst.t = 0;
+  dst.state = S.INFEED;
+  if(dst.kind === 'tear') dst.cyl.block.tgt = 1;   // blokada w górę
+}
+
+function tryRelease(n){
+  if(!bit.transferEnable){ n.wait = 'zezwolenie zdjęte'; return false; }
+  const nx = nextOf(n);
+  const w = why(nx);
+  if(w){ n.wait = w; return false; }
+  beginInfeed(nx, n.load);
+  n.state = S.OUTFEED; n.wait = '';
+  return true;
+}
+
+function injectLoad(n, load){
+  n.load = load; n.p = 1; n.opDone = true; n.state = S.OCCUPIED;
+}
+function clearLoad(n){
+  n.load = null; n.p = 0; n.opDone = false; n.state = S.EMPTY;
+}
+
+/* =======================================================================
+   STACJA 3 - DESZTAPLARKA
+   ======================================================================= */
+function destack(n, dt){
+  const L = n.lift;
+
+  if(n.step === 0){
+    if(!n.load) return;
+    if(n.state !== S.BUSY && n.state !== S.OCCUPIED) return;
+    if(n.remaining === 0){
+      n.remaining = stackSize;
+      say(3, 'stos dojechał — ' + stackSize + ' palet do wydania');
+    }
+    n.step = n.remaining <= 1 ? 80 : 10;
+    return;
+  }
+
+  if(n.step === 10){                      // szczęki otwarte, wózek na ŚRODEK
+    L.jaw.tgt = 0;
+    if(!cBack(L.jaw)) return;
+    if(liftTo(L, 2)) n.step = 20;
+  }
+  else if(n.step === 20){                 // chwyt pod drugą paletę
+    L.jaw.tgt = 1;
+    if(cOut(L.jaw)) n.step = 30;
+  }
+  else if(n.step === 30){                 // uniesienie stosu
+    if(liftTo(L, 3)){
+      n.step = 40;
+      say(3, 'stos uniesiony — dolna paleta wolna');
+    }
+  }
+  else if(n.step === 40){                 // wydanie odseparowanej palety
+    injectLoad(n, newPallet());
+    n.step = 50;
+  }
+  else if(n.step === 50){                 // czekamy aż paleta zjedzie
+    if(n.load) return;
+    n.remaining -= 1;
+    if(n.remaining <= 0){ n.step = 90; return; }
+    n.step = 60;
+  }
+  else if(n.step === 60){                 // odłożenie stosu na DÓŁ
+    if(liftTo(L, 1)) n.step = 70;
+  }
+  else if(n.step === 70){
+    L.jaw.tgt = 0;
+    if(!cBack(L.jaw)) return;
+    n.step = n.remaining <= 1 ? 80 : 10;
+  }
+  else if(n.step === 80){                 // ostatnia paleta - bez chwytania
+    L.jaw.tgt = 0;
+    liftTo(L, 2);
+    injectLoad(n, newPallet());
+    say(3, 'ostatnia paleta ze stosu — wydana bez unoszenia');
+    n.step = 50;
+  }
+  else if(n.step === 90){                 // stos wydany w całości
+    n.remaining = 0;
+    L.jaw.tgt = 0;
+    liftTo(L, 2);
+    n.step = 0;
+    say(3, 'stos wydany w całości');
+  }
+}
+
+/* =======================================================================
+   STACJA 11 - SZTAPLARKA
+   ======================================================================= */
+function stackUp(n, dt){
+  const L = n.lift;
+
+  if(!bit.stacker11){ n.opDone = true; return; }
+
+  if(n.step === 0){
+    if(!n.load){                          // spoczynek: wózek w górze
+      if(n.held > 0) L.jaw.tgt = 1;
+      liftTo(L, 3);
+      return;
+    }
+    if(n.opDone) return;                  // gotowy stos czeka na wydanie
+    if(n.state !== S.BUSY) return;
+    n.step = n.held > 0 ? 10 : 30;
+  }
+  else if(n.step === 10){                 // stos siada na nową paletę
+    if(liftTo(L, 2)) n.step = 20;
+  }
+  else if(n.step === 20){
+    L.jaw.tgt = 0;
+    if(cBack(L.jaw)) n.step = 30;
+  }
+  else if(n.step === 30){                 // wózek pod najniższą paletę
+    L.jaw.tgt = 0;
+    if(!cBack(L.jaw)) return;
+    if(liftTo(L, 1)) n.step = 40;
+  }
+  else if(n.step === 40){
+    L.jaw.tgt = 1;
+    if(cOut(L.jaw)) n.step = 50;
+  }
+  else if(n.step === 50){                 // cały stos w górę
+    if(!liftTo(L, 3)) return;
+    n.held += 1;
+    say(11, 'paleta na stosie (' + n.held + '/' + stackSize + ')');
+    clearLoad(n);
+    n.step = n.held >= stackSize ? 60 : 0;
+  }
+  else if(n.step === 60){                 // komplet - odstawienie
+    if(liftTo(L, 1)) n.step = 70;
+  }
+  else if(n.step === 70){
+    L.jaw.tgt = 0;
+    if(!cBack(L.jaw)) return;
+    injectLoad(n, newStack(n.held));
+    say(11, 'stos ' + n.held + " palet gotowy — wydanie");
+    n.held = 0;
+    n.step = 0;
+  }
+}
+
+/* =======================================================================
+   STACJA 4 - TEST SCISKANIA W TRAKCIE JAZDY
+   ======================================================================= */
+function press4(n, dt){
+  const c = n.cyl, up = [c[0], c[1]], lo = c[2];
+  const [sEntry, sStop] = sensors(n);
+
+  if(n.step === 0){
+    if(n.opDone) return;
+    if(n.state === S.BUSY){ n.step = 80; return; }
+    if(n.state !== S.INFEED) return;
+    n.rollers = true; n.t = 0; n.step = 10;
+    say(4, 'rolki dociskowe start');
+  }
+  else if(n.step === 10){                 // czekamy na czujnik wjazdu
+    if(sEntry){ n.t = 0; n.step = 20; }
+  }
+  else if(n.step === 20){                 // czasówka 1,2 s
+    n.t += dt;
+    if(n.t > 1.2){ n.t = 0; n.step = 30; }
+  }
+  else if(n.step === 30){                 // górne, po 0,4 s dolne
+    up.forEach(x => x.tgt = 1);
+    n.t += dt;
+    if(n.t > 0.4){ lo.tgt = 1; n.step = 40; }
+  }
+  else if(n.step === 40){
+    if(sStop){ n.step = 80; say(4, 'paleta w pozycji — zwalnianie docisków'); }
+  }
+  else if(n.step === 80){                 // cofanie: najpierw dolne
+    n.rollers = false;
+    lo.tgt = 0;
+    if(cBack(lo)) n.step = 90;
+  }
+  else if(n.step === 90){                 // potem górne
+    up.forEach(x => x.tgt = 0);
+    if(up.every(cBack)){ n.opDone = true; n.step = 0; }
+  }
+}
+
+/* =======================================================================
+   STACJA 5 - TEST ROZRYWANIA NA POSTOJU
+   ======================================================================= */
+function tear5(n, dt){
+  const c = n.cyl;
+
+  switch(n.step){
+    case 0:
+      if(n.state !== S.BUSY) return;
+      n.t = 0; n.step = 10; break;
+    case 10:
+      n.t += dt;
+      if(n.t > 0.5){ n.t = 0; n.step = 20; } break;
+    case 20:
+      c.lift.tgt = 1;
+      if(cOut(c.lift)){ n.step = 30; say(5, 'szczęki podniesione'); } break;
+    case 30:
+      c.jaw1.tgt = 1; c.jaw2.tgt = 1; c.jaw3.tgt = 1;
+      if(cOut(c.jaw1) && cOut(c.jaw2) && cOut(c.jaw3)){
+        n.t = 0; n.step = 40; say(5, 'szczęki zamknięte');
+      } break;
+    case 40:
+      n.t += dt;
+      if(n.t > 0.5) n.step = 50; break;
+    case 50:
+      for(let i=1;i<=6;i++) c['pull'+i].tgt = 1;
+      if([1,2,3,4,5,6].every(i => cOut(c['pull'+i]))){
+        n.t = 0; n.step = 55; say(5, 'nacisk na wszystkich siłownikach');
+      } break;
+    case 55:
+      n.t += dt;
+      if(n.t > 1.0) n.step = 60; break;
+    case 60:
+      for(let i=1;i<=6;i++) c['pull'+i].tgt = 0;
+      if([1,2,3,4,5,6].every(i => cBack(c['pull'+i]))) n.step = 70; break;
+    case 70:
+      c.jaw1.tgt = 0; c.jaw2.tgt = 0; c.jaw3.tgt = 0;
+      if(cBack(c.jaw1) && cBack(c.jaw2) && cBack(c.jaw3)) n.step = 80; break;
+    case 80:
+      c.lift.tgt = 0;
+      if(cBack(c.lift)) n.step = 90; break;
+    case 90:
+      c.block.tgt = 0;                    // blokada w dół, droga wolna
+      if(cBack(c.block)){
+        M_verdict(n);
+        n.opDone = true; n.step = 0;
+      } break;
+  }
+}
+
+// Werdykt wersji testowej: co piąta paleta NOK
+function M_verdict(n){
+  nDone += 1;
+  if(nDone % 5 === 0){
+    n.load.nok = true;
+    cNokN += 1;
+    say(5, 'paleta ' + n.load.id + ' — co piąta, werdykt NOK', 'nok');
+  } else {
+    cOkN += 1;
+    say(5, 'paleta ' + n.load.id + ' — werdykt OK', 'ok');
+  }
+}
+
+/* =======================================================================
+   POZOSTALE
+   ======================================================================= */
+function otherOps(n, dt){
+  if(n.kind === 'divert'){ n.t += dt; if(n.t > 0.5) n.opDone = true; return; }
+  n.opDone = true;
+}
+
+function pickup(n, dt){
+  n.wait = 'czeka na operatora';
+  const free = (n.sens === 0) ? true : !sensors(n)[0];
+  n.t += dt;
+  if(n.t > 5){
+    thru += n.load.n;
+    say(n.id, n.load.stack ? 'operator odebrał stos ' + n.load.n + ' palet'
+                           : 'operator odebrał paletę ' + n.load.id,
+        n.id === 13 ? 'ok' : 'nok');
+    clearLoad(n); n.t = 0;
+  }
+}
+
+/* =======================================================================
+   CYKL WEZLA
+   ======================================================================= */
+function opRequired(n){
+  if(n.kind === 'buf' || n.kind === 'chain') return false;
+  if(n.kind === 'pickup') return false;
+  if(n.kind === 'stack' && !bit.stacker11) return false;
+  return !n.opDone;
+}
+
+function nodeCycle(n, dt){
+  if(n.cyl){
+    (Array.isArray(n.cyl) ? n.cyl : Object.values(n.cyl))
+      .forEach(c => cylStep(c, estop ? 0 : dt));
+  }
+  if(n.lift) liftStep(n.lift, estop ? 0 : dt);
+
+  if(estop){ n.wait = 'brak zezwolenia'; return; }
+
+  // Desztaplarka i sztaplarka chodzą w każdym stanie węzła
+  if(n.kind === 'destack') destack(n, dt);
+  if(n.kind === 'stack')   stackUp(n, dt);
+
+  switch(n.state){
+    case S.EMPTY:
+      n.wait = 'brak ładunku';
+      break;
+
+    case S.INFEED:
+      n.p += dt / n.t0;
+      n.wait = '';
+      if(n.kind === 'press') press4(n, dt);
+      if(arrived(n) || n.p >= 1){
+        n.p = 1;
+        if(opRequired(n)){ n.state = S.STOPDLY; n.t = 0; }
+        else if(!tryRelease(n)){ n.state = S.STOPDLY; n.t = 0; }
+      }
+      break;
+
+    case S.STOPDLY:
+      n.t += dt;
+      n.wait = 'czasówka zatrzymania';
+      if(n.t > 0.15){
+        n.t = 0; n.step = 0;
+        n.state = opRequired(n) ? S.BUSY : S.OCCUPIED;
+      }
+      break;
+
+    case S.BUSY:
+      n.wait = 'trwa operacja';
+      if(n.kind === 'press')      press4(n, dt);
+      else if(n.kind === 'tear')  tear5(n, dt);
+      else if(n.kind === 'destack' || n.kind === 'stack') { /* wyżej */ }
+      else otherOps(n, dt);
+      if(n.opDone && n.load) n.state = S.OCCUPIED;
+      break;
+
+    case S.OCCUPIED:
+      if(n.kind === 'pickup'){ pickup(n, dt); break; }
+      tryRelease(n);
+      break;
+
+    case S.OUTFEED:
+      n.p += dt / n.t0;
+      n.wait = '';
+      if(n.p > 1.4){
+        n.load = null; n.p = 0; n.opDone = false; n.state = S.EMPTY;
+        if(n.kind === 'tear') n.step = 0;
+      }
+      break;
+  }
+}
+
+// czas przejazdu wezla
+order.forEach(id => { nodes[id].t0 = nodes[id].t; });
+DEF.forEach(d => { nodes[d.id].t0 = d.t; nodes[d.id].t = 0; });
+
+/* =======================================================================
+   PETLA
+   ======================================================================= */
+function tick(){
+  if(!running) return;
+  const dt = 0.05 * speed;
+  simT += dt;
+  for(let i = order.length - 1; i >= 0; i--) nodeCycle(nodes[order[i]], dt);
+  render();
+}
+
+/* =======================================================================
+   KOMENDY
+   ======================================================================= */
+function cmdStackInserted(){
+  const n = nodes[1];
+  if(n.load){ say(1, 'stacja 1 zajęta'); return; }
+  n.t0 = 4;
+  injectLoad(n, newStack(stackSize));
+  say(1, 'bit xCmdStackInserted — operator wstawił stos');
+}
+function cmdReset(){
+  say(0, 'bit xCmdReset — kasowanie alarmów');
+}
+function cmdClearMachine(){
+  build();
+  DEF.forEach(d => { nodes[d.id].t0 = d.t; nodes[d.id].t = 0; });
+  cOkN = 0; cNokN = 0; thru = 0; nDone = 0;
+  say(0, 'bit xCmdClearMachine — maszyna wyzerowana');
+}
+
+/* =======================================================================
+   WIDOK
+   ======================================================================= */
+const grid = document.getElementById('grid');
+const tiles = {};
+
+DEF.forEach(d => {
+  const el = document.createElement('div');
+  el.className = 'st';
+  el.style.gridColumn = d.col; el.style.gridRow = d.row;
+  const nm = SENSNM[d.id] || ['C1','C2'];
+  el.innerHTML =
+    '<div class="st-hd"><span class="st-no">' + d.id + '</span>' +
+    (d.inv ? '<span class="rev">REV</span>' : '') + '</div>' +
+    '<div class="st-nm">' + d.nm + '</div>' +
+    '<div class="belt"><div class="pal" hidden><span class="pal-n"></span></div></div>' +
+    '<div class="sens">' +
+      '<span class="led"><i class="dot"></i><span>' + nm[0] + '</span></span>' +
+      '<span class="led"><i class="dot"></i><span>' + nm[1] + '</span></span>' +
+    '</div><div class="state"></div>';
+  if([1,2,3,4,5,6,7,9,10,11,12,14,15].indexOf(d.id) >= 0){
+    const a = document.createElement('span'); a.className = 'arrow r'; a.textContent = '›';
+    el.appendChild(a);
+  }
+  if(d.id === 8){
+    const u = document.createElement('span'); u.className = 'arrow u'; u.textContent = '↗';
+    const dn = document.createElement('span'); dn.className = 'arrow d'; dn.textContent = '↓';
+    el.appendChild(u); el.appendChild(dn);
+  }
+  el.addEventListener('click', () => {
+    if([3,4,5,11].indexOf(d.id) >= 0){ tab = d.id; syncTabs(); render(); }
+  });
+  grid.appendChild(el);
+  tiles[d.id] = { el, pal:el.querySelector('.pal'), palN:el.querySelector('.pal-n'),
+                  d1:el.querySelectorAll('.dot')[0], d2:el.querySelectorAll('.dot')[1],
+                  st:el.querySelector('.state') };
+});
+
+function render(){
+  DEF.forEach(d => {
+    const n = nodes[d.id], t = tiles[d.id], [s1,s2] = sensors(n);
+    t.el.classList.toggle('busy', n.state === S.BUSY);
+    t.el.classList.toggle('hold', !bit.transferEnable && n.state === S.OCCUPIED);
+    t.el.classList.toggle('sel', d.id === tab && [3,4,5,11].indexOf(d.id) >= 0);
+
+    if(n.load){
+      t.pal.hidden = false;
+      t.pal.style.left = (Math.max(0, Math.min(1.4, n.p)) * 66) + '%';
+      t.pal.classList.toggle('nok', !!n.load.nok);
+      t.pal.classList.toggle('stack', !!n.load.stack);
+      t.palN.textContent = n.load.stack ? (n.load.n + '×') : ('#' + n.load.id);
+    } else t.pal.hidden = true;
+
+    t.d1.className = 'dot ' + (n.sens >= 1 ? (s1 ? 'on' : 'off') : 'dis');
+    t.d2.className = 'dot ' + (n.sens >= 2 ? (s2 ? 'on' : 'off') : 'dis');
+
+    const w = (n.state === S.OCCUPIED || n.state === S.EMPTY) && n.wait ? ' · ' + n.wait : '';
+    t.st.innerHTML = '<b>' + n.state + '</b>' + w;
+  });
+
+  document.getElementById('cOk').textContent = cOkN;
+  document.getElementById('cNok').textContent = cNokN;
+  document.getElementById('cWip').textContent = order.filter(i => nodes[i].load).length;
+  document.getElementById('cSt3').textContent = nodes[3].remaining;
+  document.getElementById('cSt11').textContent = nodes[11].held;
+  document.getElementById('thru').textContent = thru + ' palet';
+
+  const mm = Math.floor(simT/60), ss = Math.floor(simT%60);
+  document.getElementById('clk').textContent =
+    String(mm).padStart(2,'0') + ':' + String(ss).padStart(2,'0');
+
+  renderBits(); renderMech(); renderLog();
+}
+
+/* ---------- bity MAIN ---------- */
+const bitsBox = document.getElementById('bits');
+function bitRow(name, on, cmd){
+  return '<div class="bit' + (cmd ? ' cmd' : '') + '"' +
+    (cmd ? ' data-cmd="' + cmd + '"' : '') + '>' +
+    '<i class="dot ' + (on ? 'on' : 'off') + '"></i><span>' + name + '</span></div>';
+}
+function renderBits(){
+  let h = '';
+  h += bitRow('xTransferEnable', bit.transferEnable, 'transfer');
+  h += bitRow('xCmdStackInserted', false, 'stack');
+  h += bitRow('xCmdReset', false, 'reset');
+  h += bitRow('xCmdClearMachine', false, 'clear');
+  h += bitRow('xSens_St01', false, null);
+  h += bitRow('xSens_St03', sensors(nodes[3])[0], null);
+  h += bitRow('xSens_St04_Entry', sensors(nodes[4])[0], null);
+  h += bitRow('xSens_St04_Stop', sensors(nodes[4])[1], null);
+  h += bitRow('xSens_St07', sensors(nodes[7])[0], null);
+  h += bitRow('xSens_St11', sensors(nodes[11])[0], null);
+  h += bitRow('xSens_St13', sensors(nodes[13])[0], null);
+  h += bitRow('xSens_St16', sensors(nodes[16])[0], null);
+  h += bitRow('diEnc_St03 = ' + Math.round(nodes[3].lift.pos), true, null);
+  h += bitRow('diEnc_St11 = ' + Math.round(nodes[11].lift.pos), true, null);
+  h += bitRow('xOut_St03_JawClose', nodes[3].lift.jaw.tgt > 0.5, null);
+  h += bitRow('xOut_St11_JawClose', nodes[11].lift.jaw.tgt > 0.5, null);
+  bitsBox.innerHTML = h;
+}
+bitsBox.addEventListener('click', e => {
+  const el = e.target.closest('[data-cmd]');
+  if(!el) return;
+  const c = el.dataset.cmd;
+  if(c === 'transfer') bit.transferEnable = !bit.transferEnable;
+  if(c === 'stack')    cmdStackInserted();
+  if(c === 'reset')    cmdReset();
+  if(c === 'clear')    cmdClearMachine();
+  render();
+});
+
+/* ---------- mechanika ---------- */
+const mech = document.getElementById('mech');
+function cylRow(nm, io, c){
+  const dir = c.moving > 0 ? 'ext' : (c.moving < 0 ? 'ret' : (c.pos > 0.5 ? 'ext' : 'ret'));
+  const led = (c.moving > 0 || (c.moving === 0 && c.pos > 0.5)) ? 'on' : 'off';
+  return '<div class="cyl"><i class="dot ' + led + '"></i>' +
+    '<span class="cyl-nm">' + nm + '<br><small>' + io + '</small></span>' +
+    '<span class="bar"><i class="' + dir + '" style="width:' + (c.pos*100).toFixed(0) + '%"></i></span>' +
+    '<span class="pos">' + (c.pos*100).toFixed(0) + '%</span></div>';
+}
+function liftPanel(n, title, drive){
+  const L = n.lift, p = L.p;
+  const lo = p.bottom - 400, hi = p.top + 400, rng = hi - lo;
+  const x = v => ((v - lo) / rng * 100).toFixed(1) + '%';
+  const jawOpen = cBack(L.jaw), jawShut = cOut(L.jaw);
+  return '<div style="font-size:12px;color:var(--ink-2);margin-bottom:2px">' +
+      title + ' · ' + drive + '</div>' +
+    '<div class="lift">' +
+      '<span class="mk" style="left:' + x(p.bottom) + '"><b>DÓŁ ' + p.bottom + '</b></span>' +
+      '<span class="mk" style="left:' + x(p.middle) + '"><b>ŚRODEK ' + p.middle + '</b></span>' +
+      '<span class="mk" style="left:' + x(p.top) + '"><b>GÓRA ' + p.top + '</b></span>' +
+      '<span class="car" style="left:' + x(L.pos) + '"></span>' +
+    '</div>' +
+    cylRow('Szczęki', 'ruch 5 s, bez czujników', L.jaw) +
+    '<div class="kv">' +
+      '<span>pozycja</span><b>' + Math.round(L.pos) + '</b>' +
+      '<span>zadana</span><b>' + Math.round(L.tgt) + ' (' +
+        (L.sel === 1 ? 'dół' : L.sel === 2 ? 'środek' : 'góra') + ')</b>' +
+      '<span>w pozycji</span><b style="color:' + (L.inPos ? 'var(--ok)' : 'var(--no)') + '">' +
+        (L.inPos ? 'tak' : 'nie') + '</b>' +
+      '<span>szczęki</span><b>' + (jawShut ? 'zamknięte' : jawOpen ? 'otwarte' : 'w ruchu') + '</b>' +
+      '<span>krok</span><b>' + n.step + '</b>' +
+    '</div>';
+}
+function renderMech(){
+  let h = '';
+  if(tab === 3){
+    const n = nodes[3];
+    h = liftPanel(n, 'Desztaplarka', 'falownik 1') +
+      '<div class="kv"><span>palet w stosie</span><b>' + n.remaining + '</b></div>';
+  } else if(tab === 11){
+    const n = nodes[11];
+    h = liftPanel(n, 'Sztaplarka', 'falownik do ustalenia') +
+      '<div class="kv"><span>na szczękach</span><b>' + n.held + ' / ' + stackSize + '</b>' +
+      '<span>stacja</span><b>' + (bit.stacker11 ? 'włączona' : 'wyłączona — przelot') + '</b></div>';
+  } else if(tab === 4){
+    const n = nodes[4];
+    h = '<div style="font-size:12px;color:var(--ink-2);margin-bottom:8px">' +
+      'Rolki dociskowe (falownik 3): <b style="color:' +
+      (n.rollers ? 'var(--ok)' : 'var(--ink-3)') + '">' +
+      (n.rollers ? 'pracują' : 'stoją') + '</b> · zawory sterują grupami</div>';
+    GRP4.forEach((g,i) => { h += cylRow(g.nm, g.io, n.cyl[i]); });
+  } else {
+    const n = nodes[5];
+    CYL5.forEach(d => { h += cylRow(d.nm, d.io, n.cyl[d.id]); });
+  }
+  mech.innerHTML = h;
+}
+
+/* ---------- dziennik ---------- */
+const logBox = document.getElementById('log');
+function renderLog(){
+  logBox.innerHTML = log.slice(0,13).map(e => {
+    const mm = String(Math.floor(e.t/60)).padStart(2,'0');
+    const ss = String(Math.floor(e.t%60)).padStart(2,'0');
+    return '<div><time>' + mm + ':' + ss + '</time><b>' + (e.st || '—') + '</b>' +
+           '<span class="' + e.cls + '">' + e.msg + '</span></div>';
+  }).join('');
+}
+
+/* ---------- pulpit ---------- */
+const btnRun = document.getElementById('btnRun');
+btnRun.onclick = () => {
+  running = !running;
+  btnRun.textContent = running ? 'Stop' : 'Start';
+  btnRun.classList.toggle('on', running);
+};
+const btnE = document.getElementById('btnEstop');
+btnE.onclick = () => {
+  estop = !estop;
+  btnE.classList.toggle('armed', estop);
+  btnE.textContent = estop ? 'Zwolnij grzybek' : 'Grzybek';
+  say(0, estop ? 'GRZYBEK — zatrzymanie maszyny' : 'grzybek zwolniony', estop ? 'nok' : '');
+};
+const spd = document.getElementById('spd');
+spd.oninput = () => {
+  speed = spd.value / 10;
+  document.getElementById('spdV').textContent = speed.toFixed(1).replace('.',',') + '×';
+};
+const stk = document.getElementById('stk');
+stk.oninput = () => {
+  stackSize = +stk.value;
+  document.getElementById('stkV').textContent = stk.value;
+};
+const btnStk11 = document.getElementById('btnStk11');
+btnStk11.onclick = () => {
+  bit.stacker11 = !bit.stacker11;
+  btnStk11.textContent = bit.stacker11 ? 'Włączona' : 'Wyłączona';
+  btnStk11.classList.toggle('on', bit.stacker11);
+  say(11, bit.stacker11 ? 'sztaplarka włączona' : 'sztaplarka wyłączona — przelot');
+};
+
+function syncTabs(){
+  document.querySelectorAll('[data-tab]').forEach(b => {
+    b.classList.toggle('on', +b.dataset.tab === tab);
+  });
+}
+document.querySelectorAll('[data-tab]').forEach(b => {
+  b.onclick = () => { tab = +b.dataset.tab; syncTabs(); render(); };
+});
+
+/* ---------- start ---------- */
+say(0, 'symulacja gotowa — kliknij bit xCmdStackInserted');
+cmdStackInserted();
+render();
+setInterval(tick, 50);
+</script>
