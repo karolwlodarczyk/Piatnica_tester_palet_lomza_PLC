@@ -1,0 +1,835 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_Station04_Press" Id="{7b2d0600-0000-4000-9000-000000000600}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Station04_Press EXTENDS FB_RollerConveyor
+// =============================================================
+// STACJA 4 - TEST SCISKANIA DESEK
+// =============================================================
+//
+// Transporter rolkowy plus osiem silownikow dociskowych i rolki
+// dociskowe na osobnym falowniku.
+//
+// -------------------------------------------------------------
+// TEST TOCZY SIE NA JADACEJ PALECIE
+// -------------------------------------------------------------
+// To nie jest badanie na postoju. Paleta jedzie, rolki dociskowe
+// kreca sie caly czas, zeby nie utknela pod dociskiem, a
+// silowniki napieraja na deski przez cala droge do czujnikow
+// koncowych.
+//
+// Stad sekwencja siedzi w M_TravelCycle, a nie w M_OperationCycle,
+// i stad aConv[4].Cfg.xNokOnInterrupt musi byc TRUE: po
+// niekontrolowanym zatrzymaniu rolki gorne i dolne rusza z
+// roznymi predkosciami, nie wiadomo, jak daleko pojedzie paleta
+// ani czy rolki nie omskna sie na jej krawedziach. Wyniku takiego
+// badania nie da sie uznac za wiarygodny.
+//
+// -------------------------------------------------------------
+// ZAWORY GRUPOWE, POMIAR INDYWIDUALNY
+// -------------------------------------------------------------
+// Trzy zawory sterujace grupami, ale osiem przetwornikow
+// polozenia - kazdy silownik mierzony osobno. Zawory dostaja
+// sprzezenie CYLFB_EXTERNAL zlozone z monitorow swojej grupy,
+// a wykrycie pekniecia deski idzie z pojedynczego monitora.
+//
+// -------------------------------------------------------------
+// KOLEJNOSC RUCHOW
+// -------------------------------------------------------------
+// Wysuw:   najpierw GORNE, po czasowce DOLNE - inaczej dolne
+//          unioslyby palete.
+// Cofanie: odwrotnie, najpierw DOLNE, potem GORNE - gorne
+//          trzymaja palete docieta do transportera, dopoki
+//          dolne nie zejda.
+//
+// -------------------------------------------------------------
+// BAZOWANIE
+// -------------------------------------------------------------
+// W trybie recznym: wstawic palete, wysunac wszystkie silowniki,
+// wywolac M_ZeroMonitors. Punkt zerowy jest wiec na silowniku
+// WYSUNIETYM z paleta, a progi pekniecia sa niewielkimi
+// wartosciami dodatnimi liczonymi od tego punktu.
+VAR_INPUT
+
+	stIn	: ST_St04_In;
+
+END_VAR
+VAR_OUTPUT
+
+	stOut	: ST_St04_Out;
+
+	nTestStep		: INT;
+
+	// Ktore deski pekly. Indeks = numer silownika:
+	//   1..3 dolne, 4..6 gorne szerokie, 7..8 gorne waskie
+	axBoardBroken	: ARRAY[1..8] OF BOOL;
+	nBrokenCount	: INT;
+
+	// Polozenia wszystkich silownikow - do podgladu i bazowania
+	adiCylPos		: ARRAY[1..8] OF DINT;
+
+	// Mechanika wycofana i rolki stoja
+	xMechClear		: BOOL;
+
+	// Pierwszy silownik w bledzie: 1 dolne, 2 gorne szerokie,
+	// 3 gorne waskie
+	nFaultyGroup	: INT;
+	eCylAlarm		: E_CylAlarm;
+
+END_VAR
+VAR
+
+	pSt				: POINTER TO ST_St04Cfg;
+
+	// Falownik 3 - rolki dociskowe
+	pRollerDrive	: POINTER TO FB_NordSK550PP;
+
+	// Zawory grupowe
+	fbLower			: FB_Cylinder;
+	fbUpperWide		: FB_Cylinder;
+	fbUpperNarrow	: FB_Cylinder;
+
+	// Pomiar kazdego silownika osobno
+	fbMon			: ARRAY[1..8] OF FB_CylPosMonitor;
+
+	xLowerOut		: BOOL;
+	xLowerBack		: BOOL;
+	xUpperOut		: BOOL;
+	xUpperBack		: BOOL;
+
+	xPreSensDetect	: BOOL;
+
+	xRollersOn		: BOOL;
+	xRollersOnOld	: BOOL;
+
+	tonSeq			: TON;
+	tonOpWd			: TON;
+
+END_VAR
+VAR CONSTANT
+
+	ST4_IDLE			: INT := 0;
+	ST4_WAIT_TRIGGER	: INT := 20;
+	ST4_DELAY_UPPER		: INT := 30;
+	ST4_UPPER_OUT		: INT := 40;
+	ST4_DELAY_LOWER		: INT := 50;
+	ST4_LOWER_OUT		: INT := 60;
+	ST4_TEST			: INT := 70;
+	ST4_RETRACT_LOWER	: INT := 80;
+	ST4_RETRACT_UPPER	: INT := 90;
+	ST4_DONE			: INT := 100;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL STACJI 4
+// =============================================================
+
+
+// 1. Pomiary i sprzezenia grup
+M_CallCylinders();
+
+
+// 2. Blad falownika rolek dociskowych.
+//    Musi isc w alarm wezla, bo przeciazenie rolek w trakcie
+//    docisku to przerwanie testu - a to na tej stacji oznacza
+//    odrzut palety.
+M_CheckRollerDrive();
+
+
+// 3. Warstwa transportu - wola M_TravelCycle w trakcie wjazdu
+//    oraz M_OperationRequired / M_OperationCycle po zatrzymaniu
+SUPER^();
+
+
+// 4. Rolki dociskowe
+M_ApplyRollerDrive();
+
+
+// 5. Cewki na strukture wyjsciowa
+M_MapOutputs();
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_ConfigStation" Id="{7b2d0601-0000-4000-9000-000000000601}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ConfigStation
+// Wolac raz, przy starcie, PO M_Config klasy bazowej.
+VAR_INPUT
+	pStCfg		: POINTER TO ST_St04Cfg;
+
+	// Falownik rolek dociskowych - falownik 3
+	pRollerDrv	: POINTER TO FB_NordSK550PP;
+
+	// ADR(GVL_PERSIST.aCyl)
+	pCylArray	: POINTER TO ARRAY[1..32] OF ST_CylPersist;
+
+	// Pierwszy indeks stacji. Zajmuje 11 rekordow:
+	//   +0  zawor dolnych
+	//   +1  zawor gornych szerokich
+	//   +2  zawor gornych waskich
+	//   +3..+10  monitory silownikow 1..8
+	nCylBase	: INT;
+END_VAR
+VAR
+	j			: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pSt				:= pStCfg;
+pRollerDrive	:= pRollerDrv;
+
+IF pCylArray = 0 THEN
+	RETURN;
+END_IF
+
+fbLower.M_Config(
+	nId			:= nCylBase,
+	pPersist	:= ADR(pCylArray^[nCylBase])
+);
+
+fbUpperWide.M_Config(
+	nId			:= nCylBase + 1,
+	pPersist	:= ADR(pCylArray^[nCylBase + 1])
+);
+
+fbUpperNarrow.M_Config(
+	nId			:= nCylBase + 2,
+	pPersist	:= ADR(pCylArray^[nCylBase + 2])
+);
+
+FOR j := 1 TO 8 DO
+	fbMon[j].M_Config(
+		nMonitorId	:= nCylBase + 2 + j,
+		pPersist	:= ADR(pCylArray^[nCylBase + 2 + j])
+	);
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CallCylinders" Id="{7b2d0602-0000-4000-9000-000000000602}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CallCylinders
+// Monitory polozenia, agregacja grup i wywolanie zaworow.
+VAR
+	j				: INT;
+	xLowerAtOut		: BOOL;
+	xLowerAtBack	: BOOL;
+	xWideAtOut		: BOOL;
+	xWideAtBack		: BOOL;
+	xNarrowAtOut	: BOOL;
+	xNarrowAtBack	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xLowerAtOut		:= TRUE;
+xLowerAtBack	:= TRUE;
+xWideAtOut		:= TRUE;
+xWideAtBack		:= TRUE;
+xNarrowAtOut	:= TRUE;
+xNarrowAtBack	:= TRUE;
+
+nBrokenCount	:= 0;
+
+
+FOR j := 1 TO 8 DO
+
+	fbMon[j](
+		eMode		:= eMode,
+		diPosRaw	:= stIn.adiCylPos[j]
+	);
+
+	adiCylPos[j] := fbMon[j].diPos;
+
+	M_AggregateOne(j := j);
+
+	IF axBoardBroken[j] THEN
+		nBrokenCount := nBrokenCount + 1;
+	END_IF
+
+END_FOR
+
+
+// Rozbicie agregatu na grupy - osobno, zeby nie robic
+// zagniezdzonych warunkow w petli
+xLowerAtOut		:= fbMon[1].xAtExtended  AND fbMon[2].xAtExtended  AND fbMon[3].xAtExtended;
+xLowerAtBack	:= fbMon[1].xAtRetracted AND fbMon[2].xAtRetracted AND fbMon[3].xAtRetracted;
+
+xWideAtOut		:= fbMon[4].xAtExtended  AND fbMon[5].xAtExtended  AND fbMon[6].xAtExtended;
+xWideAtBack		:= fbMon[4].xAtRetracted AND fbMon[5].xAtRetracted AND fbMon[6].xAtRetracted;
+
+xNarrowAtOut	:= fbMon[7].xAtExtended  AND fbMon[8].xAtExtended;
+xNarrowAtBack	:= fbMon[7].xAtRetracted AND fbMon[8].xAtRetracted;
+
+
+fbLower(
+	eMode		:= eMode,
+	xSafetyOK	:= xSafetyOK,
+	xFbExtIn	:= xLowerAtOut,
+	xFbRetIn	:= xLowerAtBack
+);
+
+fbUpperWide(
+	eMode		:= eMode,
+	xSafetyOK	:= xSafetyOK,
+	xFbExtIn	:= xWideAtOut,
+	xFbRetIn	:= xWideAtBack
+);
+
+fbUpperNarrow(
+	eMode		:= eMode,
+	xSafetyOK	:= xSafetyOK,
+	xFbExtIn	:= xNarrowAtOut,
+	xFbRetIn	:= xNarrowAtBack
+);
+
+
+xLowerOut	:= fbLower.xExtended;
+xLowerBack	:= fbLower.xRetracted;
+xUpperOut	:= fbUpperWide.xExtended AND fbUpperNarrow.xExtended;
+xUpperBack	:= fbUpperWide.xRetracted AND fbUpperNarrow.xRetracted;
+
+xMechClear	:= xLowerBack AND xUpperBack AND NOT xRollersOn;
+
+
+M_ReadPreSensor();
+M_ScanCylinderFaults();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_AggregateOne" Id="{7b2d0603-0000-4000-9000-000000000603}">
+      <Declaration><![CDATA[METHOD PROTECTED M_AggregateOne
+// Wykrycie pekniecia deski pod jednym silownikiem.
+//
+// Silownik wysunal sie dalej, niz moglby z cala deska - deska
+// pekla. To WYNIK TESTU, nie usterka: paleta staje sie NOK
+// i nie przechodzi juz zadnych dalszych testow.
+VAR_INPUT
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF axBoardBroken[j] THEN
+	RETURN;
+END_IF
+
+IF NOT fbMon[j].xOverLimit THEN
+	RETURN;
+END_IF
+
+// Poza faza docisku przekroczenie progu nic nie znaczy -
+// silownik moze byc po prostu w ruchu
+IF (nTestStep <> ST4_LOWER_OUT) AND (nTestStep <> ST4_TEST) THEN
+	RETURN;
+END_IF
+
+axBoardBroken[j] := TRUE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xLoadNok	:= TRUE;
+xPersistDirty		:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ReadPreSensor" Id="{7b2d0604-0000-4000-9000-000000000604}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ReadPreSensor
+// Czujnik wstepny. Dopoki nie jest zamontowany, jego rola
+// przechodzi na czasowke liczona od rozpoczecia wjazdu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xPreSensDetect := FALSE;
+
+IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+IF NOT pSt^.xPreSensorInstalled THEN
+	RETURN;
+END_IF
+
+IF pSt^.xPreSensorInverted THEN
+	xPreSensDetect := NOT stIn.xPreSensRaw;
+	RETURN;
+END_IF
+
+xPreSensDetect := stIn.xPreSensRaw;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CheckRollerDrive" Id="{7b2d0605-0000-4000-9000-000000000605}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CheckRollerDrive
+// Przeciazenie rolek dociskowych w trakcie docisku to
+// przerwanie testu, a nie usterka samego napedu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pRollerDrive = 0 THEN
+	RETURN;
+END_IF
+
+IF NOT (pRollerDrive^.xFault OR pRollerDrive^.xCommError) THEN
+	RETURN;
+END_IF
+
+M_RaiseAlarm(eNew := ALM_DRIVE_FAULT);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ApplyRollerDrive" Id="{7b2d0606-0000-4000-9000-000000000606}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ApplyRollerDrive
+// Start i stop rolek dociskowych - na zboczu, tak samo jak
+// naped transportera.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pRollerDrive = 0 THEN
+	RETURN;
+END_IF
+
+IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+// Bez zezwolenia rolki nie moga sie krecic
+IF NOT xSafetyOK THEN
+	xRollersOn := FALSE;
+END_IF
+
+IF xRollersOn AND NOT xRollersOnOld THEN
+	pRollerDrive^.M_Start(lrFreq := pSt^.lrRollerFreq, xReverse := FALSE);
+END_IF
+
+IF NOT xRollersOn AND xRollersOnOld THEN
+	pRollerDrive^.M_Stop();
+END_IF
+
+xRollersOnOld := xRollersOn;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MapOutputs" Id="{7b2d0607-0000-4000-9000-000000000607}">
+      <Declaration><![CDATA[METHOD PROTECTED M_MapOutputs
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stOut.xLowerExtend			:= fbLower.xCoilExtend;
+stOut.xLowerRetract			:= fbLower.xCoilRetract;
+
+stOut.xUpperWideExtend		:= fbUpperWide.xCoilExtend;
+stOut.xUpperWideRetract		:= fbUpperWide.xCoilRetract;
+
+stOut.xUpperNarrowExtend	:= fbUpperNarrow.xCoilExtend;
+stOut.xUpperNarrowRetract	:= fbUpperNarrow.xCoilRetract;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ScanCylinderFaults" Id="{7b2d0608-0000-4000-9000-000000000608}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ScanCylinderFaults
+// Pierwsza grupa w bledzie zostaje wskazana i idzie w alarm.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nFaultyGroup <> 0 THEN
+	RETURN;
+END_IF
+
+IF fbLower.xAlarm THEN
+	nFaultyGroup	:= 1;
+	eCylAlarm		:= fbLower.eAlarm;
+END_IF
+
+IF fbUpperWide.xAlarm AND (nFaultyGroup = 0) THEN
+	nFaultyGroup	:= 2;
+	eCylAlarm		:= fbUpperWide.eAlarm;
+END_IF
+
+IF fbUpperNarrow.xAlarm AND (nFaultyGroup = 0) THEN
+	nFaultyGroup	:= 3;
+	eCylAlarm		:= fbUpperNarrow.eAlarm;
+END_IF
+
+IF nFaultyGroup <> 0 THEN
+	M_RaiseAlarm(eNew := ALM_OPERATION_FAILED);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_TestEnabled" Id="{7b2d0609-0000-4000-9000-000000000609}">
+      <Declaration><![CDATA[METHOD PROTECTED M_TestEnabled : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_TestEnabled := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+// Operator wylaczyl stacje - zostaje sam przejazd
+IF NOT pP^.Cfg.xStationEnabled THEN
+	RETURN;
+END_IF
+
+// Paleta juz odrzucona - zadnych dalszych testow
+IF pP^.Mem.xLoadNok THEN
+	RETURN;
+END_IF
+
+M_TestEnabled := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_TravelCycle" Id="{7b2d060a-0000-4000-9000-00000000060a}">
+      <Declaration><![CDATA[METHOD PROTECTED M_TravelCycle
+// Test toczy sie w trakcie wjazdu palety.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_SeqCycle();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationRequired" Id="{7b2d060b-0000-4000-9000-00000000060b}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationRequired : BOOL
+// Zatrzymujemy palete tylko wtedy, gdy sekwencja nie zdazyla
+// sie dokonczyc w trakcie przejazdu.
+//
+// Cofanie silownikow rusza juz na pierwszym czujniku koncowym,
+// wiec przy pustej nastepnej stacji mechanika zwykle zdazy
+// zejsc i paleta pojedzie dalej bez zatrzymania.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationRequired := TRUE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+M_OperationRequired := NOT pP^.Mem.xOperationDone;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationCycle" Id="{7b2d060c-0000-4000-9000-00000000060c}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationCycle : BOOL
+// Dokonczenie sekwencji po zatrzymaniu palety.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_SeqCycle();
+
+M_OperationCycle := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+M_OperationCycle := pP^.Mem.xOperationDone AND xMechClear;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_SeqCycle" Id="{7b2d060d-0000-4000-9000-00000000060d}">
+      <Declaration><![CDATA[METHOD PROTECTED M_SeqCycle
+// Jedna sekwencja stacji, wolana i w trakcie jazdy,
+// i po zatrzymaniu.
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pSt = 0 THEN
+	M_RaiseAlarm(eNew := ALM_NOT_CONFIGURED);
+	RETURN;
+END_IF
+
+
+// ---------------------------------------------------------
+// WATCHDOG CALEJ OPERACJI
+// ---------------------------------------------------------
+
+tonOpWd(IN := (nTestStep <> ST4_IDLE), PT := pSt^.tOpWatchdog);
+
+IF tonOpWd.Q THEN
+	M_RaiseAlarm(eNew := ALM_OPERATION_FAILED);
+	RETURN;
+END_IF
+
+
+CASE nTestStep OF
+
+ST4_IDLE:
+	IF pP = 0 THEN
+		RETURN;
+	END_IF
+
+	// Ta paleta zostala juz obsluzona - nie zaczynamy od nowa
+	IF pP^.Mem.xOperationDone THEN
+		RETURN;
+	END_IF
+
+	// Wznowienie po przerwaniu: paleta stoi, jest juz NOK,
+	// wiec nie badamy jej ponownie - tylko sciagamy mechanike
+	IF eState = NODE_BUSY THEN
+		nTestStep := ST4_RETRACT_LOWER;
+		RETURN;
+	END_IF
+
+	// Poczatek nowej palety - wykrywamy po tym, ze wezel
+	// jest w fazie wjazdu
+	IF eState <> NODE_INFEED THEN
+		RETURN;
+	END_IF
+
+	FOR j := 1 TO 8 DO
+		axBoardBroken[j] := FALSE;
+	END_FOR
+
+	tonSeq(IN := FALSE);
+
+	IF NOT M_TestEnabled() THEN
+		// Bez testu zostaje przejazd, ale mechanika i tak musi
+		// byc potwierdzona jako wycofana
+		nTestStep := ST4_RETRACT_LOWER;
+		RETURN;
+	END_IF
+
+	// Rolki dociskowe kreca sie od chwili wjazdu, zeby paleta
+	// nie utknela pod dociskiem
+	xRollersOn	:= TRUE;
+	nTestStep	:= ST4_WAIT_TRIGGER;
+
+
+ST4_WAIT_TRIGGER:
+	// Z czujnikiem wstepnym czekamy na niego, bez czujnika
+	// odmierzamy czas od rozpoczecia wjazdu
+	IF pSt^.xPreSensorInstalled THEN
+		IF xPreSensDetect THEN
+			tonSeq(IN := FALSE);
+			nTestStep := ST4_DELAY_UPPER;
+		END_IF
+		RETURN;
+	END_IF
+
+	tonSeq(IN := TRUE, PT := pSt^.tEntryToUpper);
+
+	IF tonSeq.Q THEN
+		tonSeq(IN := FALSE);
+		nTestStep := ST4_UPPER_OUT;
+	END_IF
+
+
+ST4_DELAY_UPPER:
+	tonSeq(IN := TRUE, PT := pSt^.tPreToUpper);
+
+	IF tonSeq.Q THEN
+		tonSeq(IN := FALSE);
+		nTestStep := ST4_UPPER_OUT;
+	END_IF
+
+
+ST4_UPPER_OUT:
+	// Gorne ida pierwsze, zeby dolne nie uniosly palety
+	fbUpperWide.M_Extend();
+	fbUpperNarrow.M_Extend();
+
+	tonSeq(IN := TRUE, PT := pSt^.tUpperToLower);
+
+	IF tonSeq.Q THEN
+		tonSeq(IN := FALSE);
+		nTestStep := ST4_DELAY_LOWER;
+	END_IF
+
+
+ST4_DELAY_LOWER:
+	fbLower.M_Extend();
+	nTestStep := ST4_LOWER_OUT;
+
+
+ST4_LOWER_OUT:
+	// Czekamy az wszystkie silowniki dojda do wysuwu nastawionego
+	// przez operatora. Od tego momentu trwa wlasciwy docisk.
+	IF xUpperOut AND xLowerOut THEN
+		nTestStep := ST4_TEST;
+	END_IF
+
+	M_CheckEndOfTravel();
+
+
+ST4_TEST:
+	M_CheckEndOfTravel();
+
+
+ST4_RETRACT_LOWER:
+	// Cofanie odwrotnie do wysuwu: najpierw dolne. Gorne
+	// trzymaja palete docieta do transportera, dopoki dolne
+	// nie zejda - inaczej dolne mogly by ja uniesc.
+	xRollersOn := FALSE;
+	fbLower.M_Retract();
+
+	IF fbLower.xRetracted THEN
+		nTestStep := ST4_RETRACT_UPPER;
+	END_IF
+
+
+ST4_RETRACT_UPPER:
+	fbUpperWide.M_Retract();
+	fbUpperNarrow.M_Retract();
+
+	IF xUpperBack THEN
+		nTestStep := ST4_DONE;
+	END_IF
+
+
+ST4_DONE:
+	IF NOT xMechClear THEN
+		RETURN;
+	END_IF
+
+	// Stacja sama zamyka operacje. Jesli zdazyla to zrobic
+	// przed dojazdem do czujnikow, M_OperationRequired zwroci
+	// FALSE i paleta pojedzie dalej bez zatrzymania.
+	IF pP <> 0 THEN
+		pP^.Mem.xOperationDone	:= TRUE;
+		xPersistDirty			:= TRUE;
+	END_IF
+
+	tonOpWd(IN := FALSE);
+	nTestStep := ST4_IDLE;
+
+
+ELSE
+	nTestStep := ST4_IDLE;
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CheckEndOfTravel" Id="{7b2d060e-0000-4000-9000-00000000060e}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CheckEndOfTravel
+// Koniec docisku.
+//
+// Cofanie rusza juz na PIERWSZYM czujniku koncowym, a nie
+// dopiero po zatrzymaniu palety. Dzieki temu mechanika zdazy
+// zejsc zanim paleta stanie i przy pustej nastepnej stacji
+// mozna pojechac dalej bez zatrzymywania sie.
+//
+// Pekniecie deski konczy docisk natychmiast - dalsze badanie
+// tej palety nie ma sensu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nBrokenCount > 0 THEN
+	nTestStep := ST4_RETRACT_LOWER;
+	RETURN;
+END_IF
+
+IF xSens1Detect OR xSens2Detect THEN
+	nTestStep := ST4_RETRACT_LOWER;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d060f-0000-4000-9000-00000000060f}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbLower.M_Reset();
+fbUpperWide.M_Reset();
+fbUpperNarrow.M_Reset();
+
+IF pRollerDrive <> 0 THEN
+	pRollerDrive^.M_Reset();
+END_IF
+
+tonSeq(IN := FALSE);
+tonOpWd(IN := FALSE);
+
+// Po resecie mechanika musi zejsc, zanim paleta ruszy dalej.
+// Nie wracamy do docisku - przerwany test na tej stacji jest
+// juz nieodwracalnie uniewazniony.
+xRollersOn		:= FALSE;
+nTestStep		:= ST4_RETRACT_LOWER;
+nFaultyGroup	:= 0;
+eCylAlarm		:= ALM_CYL_NONE;
+
+M_Reset := SUPER^.M_Reset();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManCylinder" Id="{7b2d0610-0000-4000-9000-000000000610}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ManCylinder
+// Sterowanie reczne grupami.
+// nSel: 1 dolne, 2 gorne szerokie, 3 gorne waskie
+VAR_INPUT
+	nSel	: INT;
+	xExt	: BOOL;
+	xRet	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nSel = 1 THEN
+	fbLower.M_ManJog(xExt := xExt, xRet := xRet);
+	RETURN;
+END_IF
+
+IF nSel = 2 THEN
+	fbUpperWide.M_ManJog(xExt := xExt, xRet := xRet);
+	RETURN;
+END_IF
+
+IF nSel = 3 THEN
+	fbUpperNarrow.M_ManJog(xExt := xExt, xRet := xRet);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ZeroMonitors" Id="{7b2d0611-0000-4000-9000-000000000611}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ZeroMonitors : BOOL
+// Bazowanie przetwornikow.
+//
+// Procedura: w trybie recznym wstawic palete, wysunac wszystkie
+// silowniki, wywolac te metode. Punkt zerowy jest wiec na
+// silowniku WYSUNIETYM z paleta.
+//
+// nSel = 0 zeruje wszystkie naraz, 1..8 pojedynczy silownik.
+VAR_INPUT
+	nSel	: INT;
+END_VAR
+VAR
+	j		: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ZeroMonitors := FALSE;
+
+IF nSel = 0 THEN
+	FOR j := 1 TO 8 DO
+		fbMon[j].M_Zero();
+	END_FOR
+	M_ZeroMonitors := TRUE;
+	RETURN;
+END_IF
+
+IF (nSel < 1) OR (nSel > 8) THEN
+	RETURN;
+END_IF
+
+M_ZeroMonitors := fbMon[nSel].M_Zero();
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

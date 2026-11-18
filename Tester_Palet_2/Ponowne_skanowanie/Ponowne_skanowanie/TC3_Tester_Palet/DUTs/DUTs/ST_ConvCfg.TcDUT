@@ -1,0 +1,121 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ConvCfg" Id="{7a1c0005-0000-4000-9000-000000000005}">
+    <Declaration><![CDATA[TYPE ST_ConvCfg :
+STRUCT
+	// =========================================================
+	// NASTAWY TRANSPORTERA - ZMIENNE NIEULOTNE
+	// =========================================================
+	//
+	// Caly ten rekord jest edytowalny przez operatora z HMI.
+	// Instancja lezy w GVL_PERSIST.aConv[n], FB dostaje na nia
+	// wskaznik przez M_Config. Nic w tej strukturze nie jest
+	// modyfikowane przez kod - tylko przez operatora.
+
+	// Opis wezla na HMI
+	sName				: STRING(31);
+
+
+	// ---------------------------------------------------------
+	// NAPED
+	// ---------------------------------------------------------
+
+	// Czestotliwosc w pracy automatycznej [Hz]
+	lrFreqAuto			: LREAL := 30.0;
+
+	// Czestotliwosc w pracy recznej [Hz]
+	lrFreqManual		: LREAL := 15.0;
+
+	// Trwale odwrocenie kierunku obrotow.
+	// Dla silnikow podlaczonych odwrotnie - zamiast przekladac
+	// fazy, odwracamy bit w jednym miejscu.
+	xInvertDirection	: BOOL := FALSE;
+
+	// Opoznienie zatrzymania po wykryciu pozycji przez czujniki
+	tStopDelay			: TIME := T#150MS;
+
+
+	// ---------------------------------------------------------
+	// CZUJNIKI
+	// ---------------------------------------------------------
+	//
+	// Czujniki pracuja w logice odwroconej: sygnal 1 = wolne,
+	// sygnal 0 = cos widac. Obecnosc w pozycji koncowej to
+	// zero z OBU czujnikow.
+	//
+	// Wylaczenie czujnika = serwis uznal go za uszkodzony,
+	// jego sygnal jest ignorowany. Wylaczenie OBU przelacza
+	// wezel w tryb czasowkowy (patrz tBlindTravel).
+
+	xSensor1Enabled		: BOOL := TRUE;
+	xSensor2Enabled		: BOOL := TRUE;
+
+	// Polaryzacja czujnikow.
+	// TRUE  - logika odwrocona: 0 = czujnik cos widzi (maszyna docelowa)
+	// FALSE - logika wprost:    1 = czujnik cos widzi (wersja testowa)
+	xSensorsInverted	: BOOL := TRUE;
+
+	// Czas stabilnego stanu, po ktorym uznajemy niezgodnosc
+	// czujnikow albo niezgodnosc pamieci za rzeczywista
+	tSensorSettle		: TIME := T#1S;
+
+
+	// ---------------------------------------------------------
+	// CZASY PRZEJAZDU
+	// ---------------------------------------------------------
+
+	// Watchdog wjazdu - po tym czasie ladunek MUSI byc
+	// w pozycji koncowej, inaczej alarm
+	tInfeedWatchdog		: TIME := T#20S;
+
+	// Watchdog wyjazdu - po tym czasie ladunek MUSI zejsc
+	// z pola czujnikow, inaczej alarm
+	tOutfeedWatchdog	: TIME := T#20S;
+
+	// Czas przejazdu w trybie bez czujnikow. Liczony od
+	// jednoczesnego ruszenia obu transporterow.
+	tBlindTravel		: TIME := T#6S;
+
+	// Czas potwierdzenia, ze ladunek naprawde zjechal
+	tClearDelay			: TIME := T#500MS;
+
+
+	// ---------------------------------------------------------
+	// ZACHOWANIE
+	// ---------------------------------------------------------
+
+	// Operacja technologiczna stacji wlaczona.
+	// FALSE = stacja realizuje wylacznie przejazd.
+	xStationEnabled		: BOOL := TRUE;
+
+	// Zgoda na przejazd bez zatrzymania, gdy na wezle nie ma
+	// nic do zrobienia a nastepnik jest gotowy
+	xAllowPassThrough	: BOOL := TRUE;
+
+	// Przerwanie operacji unieważnia wynik testu.
+	//
+	// TRUE  - grzyb, kurtyna, przeciazenie napedu, zanik
+	//         zasilania w trakcie testu oznaczaja, ze wyniku
+	//         nie da sie juz uznac za wiarygodny: paleta idzie
+	//         na odrzut i nie jest badana ponownie.
+	//         Ustawic na stacjach 4 i 6.
+	//
+	// FALSE - po ustapieniu przyczyny mozna kontynuowac albo
+	//         powtorzyc cykl od poczatku. Pozostale stacje.
+	xNokOnInterrupt		: BOOL := FALSE;
+
+	// Ile razy maszyna sprobuje sama dokonczyc przerwany
+	// przejazd po resecie operatora
+	nResumeRetries		: INT := 1;
+
+	// Odbior przez operatora potwierdzany przyciskiem.
+	// FALSE = miejsce uznajemy za wolne po tPickupTimeout
+	// od zniknieca ladunku z czujnikow (stacje 13 i 16).
+	xPickupByButton		: BOOL := TRUE;
+	tPickupTimeout		: TIME := T#10S;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

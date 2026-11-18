@@ -1,0 +1,46 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_WaitCause" Id="{7a1c0003-0000-4000-9000-000000000003}">
+    <Declaration><![CDATA[TYPE E_WaitCause :
+(
+	// =========================================================
+	// JEDNOZNACZNA PRZYCZYNA POSTOJU
+	// =========================================================
+	//
+	// W kazdym cyklu wezel ustawia DOKLADNIE JEDNA przyczyne.
+	// Jesli wezel stoi, ta zmienna mowi czego brakuje - bez
+	// koniecznosci wchodzenia w kod.
+
+	WAIT_NONE				:= 0,
+
+	// --- warunki wlasne wezla ---
+	WAIT_NO_SAFETY			:= 1,	// STO / lancuch bezpieczenstwa
+	WAIT_NOT_AUTO			:= 2,	// tryb inny niz AUTO
+	WAIT_ALARM_ACTIVE		:= 3,	// alarm wlasny
+	WAIT_STATE_UNVERIFIED	:= 4,	// pamiec wymaga potwierdzenia
+	WAIT_NO_LOAD			:= 5,	// pusto, nie ma czego wydac
+	WAIT_OPERATION_BUSY		:= 6,	// trwa operacja technologiczna
+	WAIT_DRIVE_NOT_READY	:= 7,	// falownik niegotowy
+	WAIT_DRIVE_FAULT		:= 8,	// blad falownika
+	WAIT_STEP_ACK			:= 9,	// tryb krokowy - brak potwierdzenia
+	WAIT_NOT_CONFIGURED		:= 10,	// brak M_Config
+	WAIT_STATION_NOT_READY	:= 11,	// mechanika stacji nie w pozycji
+	WAIT_TRANSFER_HOLD		:= 12,	// zdjete reczne zezwolenie na przejazd
+	WAIT_PICKUP				:= 13,	// czeka na odbior przez operatora
+
+	// --- warunki nastepnego wezla ---
+	WAIT_NEXT_NOT_LINKED	:= 20,	// nie podpieto nastepnika
+	WAIT_NEXT_OCCUPIED		:= 21,	// nastepnik zajety
+	WAIT_NEXT_ALARM			:= 22,	// nastepnik w alarmie
+	WAIT_NEXT_UNVERIFIED	:= 23,	// nastepnik wymaga weryfikacji
+	WAIT_NEXT_NOT_AUTO		:= 24,	// nastepnik nie w AUTO
+	WAIT_NEXT_NO_SAFETY		:= 25,	// nastepnik bez zezwolenia
+	WAIT_NEXT_BUSY			:= 26,	// nastepnik w trakcie operacji
+
+	// --- warunki poprzedniego wezla ---
+	WAIT_PREV_NOT_READY		:= 30
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

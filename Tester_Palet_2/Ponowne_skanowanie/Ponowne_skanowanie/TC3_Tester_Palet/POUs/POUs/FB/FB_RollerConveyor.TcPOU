@@ -1,0 +1,262 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_RollerConveyor" Id="{7b2d0200-0000-4000-9000-000000000200}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_RollerConveyor EXTENDS FB_TransportNodeBase
+// =============================================================
+// TRANSPORTER ROLKOWY
+// =============================================================
+//
+// Standardowy wezel maszyny: naped NORDAC PRO SK 550P plus dwa
+// czujniki optyczne na koncu transportera.
+//
+// -------------------------------------------------------------
+// CZUJNIKI
+// -------------------------------------------------------------
+// Logika ODWROCONA: sygnal 1 = wolne, sygnal 0 = cos widac.
+// Obecnosc palety w pozycji koncowej to ZERO Z OBU czujnikow -
+// sa ustawione geometrycznie tak, ze jeden widzi pierwsza,
+// a drugi ostatnia kostke palety.
+//
+// W trakcie przejazdu kostki palety "migaja" pierwszym
+// czujnikiem. Nie ma to znaczenia, bo pozycje uznajemy dopiero
+// po zgodnym zeru z obu czujnikow.
+//
+// Kazdy czujnik operator moze wylaczyc z HMI (uszkodzony).
+// Wylaczenie obu przelacza wezel na przejazd czasowkowy.
+//
+// -------------------------------------------------------------
+// NAPED
+// -------------------------------------------------------------
+// FB nie wola metod napedu co cykl, tylko na zboczu zadania.
+// FB_NordSK550PP przy blokadzie (blad, STO, komunikacja) sam
+// kasuje zadanie ruchu - i naped NIE MOZE ruszyc sam po
+// ustapieniu przyczyny. Wolanie M_Start co cykl zepsuloby
+// to zabezpieczenie.
+VAR_INPUT
+
+	// Surowe sygnaly czujnikow, logika odwrocona
+	xSens1Raw		: BOOL := TRUE;
+	xSens2Raw		: BOOL := TRUE;
+
+END_VAR
+VAR_OUTPUT
+
+	// Stan czujnikow po odwroceniu logiki i po uwzglednieniu
+	// wylaczen - do podgladu na HMI
+	xSens1Detect	: BOOL;
+	xSens2Detect	: BOOL;
+
+END_VAR
+VAR
+
+	pDrive			: POINTER TO FB_NordSK550PP;
+
+	xRunOld			: BOOL;
+	xRevOld			: BOOL;
+	xRevOut			: BOOL;
+	lrFreqOld		: LREAL;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL TRANSPORTERA ROLKOWEGO
+// =============================================================
+
+
+// 1. Czujniki -> szew klasy bazowej
+M_ReadSensors();
+
+
+// 2. Stan napedu -> szew klasy bazowej
+M_ReadDrive();
+
+
+// 3. Wspolna logika wezla
+SUPER^();
+
+
+// 4. Zadanie klasy bazowej -> naped
+M_ApplyDrive();
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_ConfigDrive" Id="{7b2d0201-0000-4000-9000-000000000201}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ConfigDrive
+// Podpiecie falownika. Wolac raz, przy starcie.
+VAR_INPUT
+	pDrv	: POINTER TO FB_NordSK550PP;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pDrive := pDrv;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ReadSensors" Id="{7b2d0202-0000-4000-9000-000000000202}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ReadSensors
+// Odwrocenie logiki i uwzglednienie wylaczen serwisowych.
+VAR
+	xS1	: BOOL;
+	xS2	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pP = 0 THEN
+	xSensUsable		:= FALSE;
+	xSensLoadAtStop	:= FALSE;
+	xSensLoadNone	:= FALSE;
+	xSensConflict	:= FALSE;
+	xSens1Detect	:= FALSE;
+	xSens2Detect	:= FALSE;
+	RETURN;
+END_IF
+
+
+// Polaryzacja czujnikow z nastaw - maszyna docelowa pracuje
+// w logice odwroconej, wersja testowa wprost
+IF pP^.Cfg.xSensorsInverted THEN
+	xS1 := NOT xSens1Raw;
+	xS2 := NOT xSens2Raw;
+ELSE
+	xS1 := xSens1Raw;
+	xS2 := xSens2Raw;
+END_IF
+
+xSens1Detect := xS1 AND pP^.Cfg.xSensor1Enabled;
+xSens2Detect := xS2 AND pP^.Cfg.xSensor2Enabled;
+
+
+// --- oba czujniki sprawne ---
+IF pP^.Cfg.xSensor1Enabled AND pP^.Cfg.xSensor2Enabled THEN
+	xSensUsable		:= TRUE;
+	xSensLoadAtStop	:= xS1 AND xS2;
+	xSensLoadNone	:= NOT xS1 AND NOT xS2;
+	xSensConflict	:= xS1 XOR xS2;
+	RETURN;
+END_IF
+
+
+// --- pracuje tylko czujnik 1 ---
+IF pP^.Cfg.xSensor1Enabled THEN
+	xSensUsable		:= TRUE;
+	xSensLoadAtStop	:= xS1;
+	xSensLoadNone	:= NOT xS1;
+	xSensConflict	:= FALSE;
+	RETURN;
+END_IF
+
+
+// --- pracuje tylko czujnik 2 ---
+IF pP^.Cfg.xSensor2Enabled THEN
+	xSensUsable		:= TRUE;
+	xSensLoadAtStop	:= xS2;
+	xSensLoadNone	:= NOT xS2;
+	xSensConflict	:= FALSE;
+	RETURN;
+END_IF
+
+
+// --- oba wylaczone: przejazd na czasowke ---
+xSensUsable		:= FALSE;
+xSensLoadAtStop	:= FALSE;
+xSensLoadNone	:= FALSE;
+xSensConflict	:= FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ReadDrive" Id="{7b2d0203-0000-4000-9000-000000000203}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ReadDrive
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pDrive = 0 THEN
+	xDrvReady := FALSE;
+	xDrvFault := FALSE;
+	RETURN;
+END_IF
+
+xDrvFault := pDrive^.xFault OR pDrive^.xCommError;
+xDrvReady := NOT pDrive^.xError;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ApplyDrive" Id="{7b2d0204-0000-4000-9000-000000000204}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ApplyDrive
+// Przepisanie zadania klasy bazowej na metody falownika.
+// Wylacznie na zboczach - patrz komentarz w naglowku FB.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pDrive = 0 THEN
+	RETURN;
+END_IF
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+
+// Trwale odwrocenie kierunku dla zle podlaczonych silnikow
+xRevOut := xDrvRev XOR pP^.Cfg.xInvertDirection;
+
+
+// --- start ---
+IF xDrvRun AND NOT xRunOld THEN
+	pDrive^.M_Start(lrFreq := lrDrvFreq, xReverse := xRevOut);
+	xRevOld		:= xRevOut;
+	lrFreqOld	:= lrDrvFreq;
+	xRunOld		:= xDrvRun;
+	RETURN;
+END_IF
+
+
+// --- stop ---
+IF NOT xDrvRun AND xRunOld THEN
+	pDrive^.M_Stop();
+	xRunOld := xDrvRun;
+	RETURN;
+END_IF
+
+
+IF NOT xDrvRun THEN
+	xRunOld := xDrvRun;
+	RETURN;
+END_IF
+
+
+// --- zmiana kierunku w ruchu (tylko tryb reczny) ---
+IF xRevOut <> xRevOld THEN
+	pDrive^.M_Start(lrFreq := lrDrvFreq, xReverse := xRevOut);
+	xRevOld		:= xRevOut;
+	lrFreqOld	:= lrDrvFreq;
+	RETURN;
+END_IF
+
+
+// --- zmiana zadanej czestotliwosci ---
+IF lrDrvFreq <> lrFreqOld THEN
+	pDrive^.M_SetFrequency(lrFreq := lrDrvFreq);
+	lrFreqOld := lrDrvFreq;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d0205-0000-4000-9000-000000000205}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+// Reset wezla plus kasowanie bledu falownika.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pDrive <> 0 THEN
+	pDrive^.M_Reset();
+END_IF
+
+M_Reset := SUPER^.M_Reset();
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

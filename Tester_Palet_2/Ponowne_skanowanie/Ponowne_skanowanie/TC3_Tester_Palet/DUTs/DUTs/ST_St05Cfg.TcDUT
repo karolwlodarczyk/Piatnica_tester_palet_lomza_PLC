@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_St05Cfg" Id="{7a1c0020-0000-4000-9000-000000000020}">
+    <Declaration><![CDATA[TYPE ST_St05Cfg :
+STRUCT
+	// =========================================================
+	// STACJA 5 - TEST ROZRYWANIA, NASTAWY NIEULOTNE
+	// =========================================================
+	//
+	// Czasy samych ruchow silownikow siedza w ich wlasnych
+	// rekordach (GVL_PERSIST.aCyl). Tutaj sa tylko czasy
+	// nalezace do SEKWENCJI stacji.
+
+	// Od potwierdzenia palety na blokadzie do podniesienia szczek
+	tDetectToLift		: TIME := T#500MS;
+
+	// Od zamkniecia szczek do rozpoczecia rozrywania
+	tJawsToPull			: TIME := T#300MS;
+
+	// Watchdog calej operacji testu
+	tOpWatchdog			: TIME := T#60S;
+
+	// UWAGA: blokada NIE podnosi sie na czasowke. Idzie w gore
+	// w chwili, gdy z poprzedniej stacji rusza paleta - wtedy
+	// nikt jej nie stoi na drodze, a czasu na podniesienie jest
+	// tyle, ile trwa przejazd. Czas ruchu samej blokady i jego
+	// watchdog siedza w GVL_PERSIST.aCyl.
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_CylAlarm" Id="{7a1c0013-0000-4000-9000-000000000013}">
+    <Declaration><![CDATA[TYPE E_CylAlarm :
+(
+	ALM_CYL_NONE				:= 0,
+
+	// Nie potwierdzil wysuwu w czasie tExtendWatchdog
+	ALM_CYL_EXTEND_TIMEOUT		:= 1,
+
+	// Nie potwierdzil wsuwu w czasie tRetractWatchdog
+	ALM_CYL_RETRACT_TIMEOUT		:= 2,
+
+	// Obie krancowki aktywne jednoczesnie
+	ALM_CYL_BOTH_SWITCHES		:= 3,
+
+	// Przetwornik nie zostal zbazowany, a progi sa uzywane
+	ALM_CYL_NOT_ZEROED			:= 4,
+
+	// Zejscie z potwierdzonego polozenia bez komendy
+	ALM_CYL_POSITION_LOST		:= 5,
+
+	// Brak wywolania M_Config
+	ALM_CYL_NOT_CONFIGURED		:= 6
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

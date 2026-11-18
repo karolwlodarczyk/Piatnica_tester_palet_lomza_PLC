@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_StackPersist" Id="{7a1c0043-0000-4000-9000-000000000043}">
+    <Declaration><![CDATA[TYPE ST_StackPersist :
+STRUCT
+	Cfg		: ST_StackCfg;
+	Mem		: ST_StackMem;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

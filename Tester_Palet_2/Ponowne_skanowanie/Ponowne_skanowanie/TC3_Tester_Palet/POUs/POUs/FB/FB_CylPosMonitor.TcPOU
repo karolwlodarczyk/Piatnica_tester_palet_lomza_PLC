@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_CylPosMonitor" Id="{7b2d0400-0000-4000-9000-000000000400}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_CylPosMonitor
+// =============================================================
+// MONITOR POLOZENIA SILOWNIKA
+// =============================================================
+//
+// Osobny pomiar dla silownika, ktory nie ma wlasnego zaworu.
+//
+// Stacja 4 steruje silownikami w GRUPACH - jeden zawor na kilka
+// sztuk - ale kazdy silownik ma wlasny przetwornik IO-Link
+// o wartosci bezwzglednej. Tu siedzi cala obsluga tego pomiaru:
+// bazowanie, progi polozen i wykrycie, ze silownik wysunal sie
+// dalej, niz moglby z cala paleta.
+//
+// xOverLimit NIE JEST ALARMEM. To wynik testu: deska pekla.
+// Decyzje o losie palety podejmuje stacja.
+VAR_INPUT
+
+	eMode		: E_MachineMode;
+
+	// Surowe wskazanie przetwornika
+	diPosRaw	: DINT;
+
+END_VAR
+VAR_OUTPUT
+
+	// Polozenie wzgledem punktu bazowania, dodatnie w kierunku
+	// wysuwu
+	diPos			: DINT;
+
+	xAtExtended		: BOOL;
+	xAtRetracted	: BOOL;
+
+	// Silownik wysunal sie ponad prog - deska pekla / odpadla
+	xOverLimit		: BOOL;
+
+	// Nacisk utrzymany przez nastawiony czas
+	xHoldDone		: BOOL;
+
+	// Przetwornik zbazowany - bez tego progi nic nie znacza
+	xZeroed			: BOOL;
+
+END_VAR
+VAR
+
+	nId		: INT;
+	pP		: POINTER TO ST_CylPersist;
+
+	tonHold	: TON;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[IF pP = 0 THEN
+	diPos			:= 0;
+	xAtExtended		:= FALSE;
+	xAtRetracted	:= FALSE;
+	xOverLimit		:= FALSE;
+	xHoldDone		:= FALSE;
+	xZeroed			:= FALSE;
+	RETURN;
+END_IF
+
+
+xZeroed := pP^.Mem.xZeroed;
+
+
+// -------------------------------------------------------------
+// POLOZENIE WZGLEDEM BAZY
+// -------------------------------------------------------------
+
+IF pP^.Cfg.xInvertPos THEN
+	diPos := pP^.Mem.diZeroOffset - diPosRaw;
+ELSE
+	diPos := diPosRaw - pP^.Mem.diZeroOffset;
+END_IF
+
+
+// -------------------------------------------------------------
+// PROGI
+// -------------------------------------------------------------
+
+xAtExtended		:= (diPos >= pP^.Cfg.diPosExtended);
+xAtRetracted	:= (diPos <= pP^.Cfg.diPosRetracted);
+xOverLimit		:= (diPos > pP^.Cfg.diPosLimit);
+
+
+// -------------------------------------------------------------
+// CZAS TRZYMANIA NACISKU
+// -------------------------------------------------------------
+//
+// Wlasny licznik na silownik - kazdy idzie z inna predkoscia,
+// wiec kazdy zaczyna liczyc w innym momencie.
+
+tonHold(IN := (diPos >= pP^.Cfg.diPosHoldStart), PT := pP^.Cfg.tHold);
+xHoldDone := tonHold.Q;
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_Config" Id="{7b2d0401-0000-4000-9000-000000000401}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Config
+VAR_INPUT
+	nMonitorId	: INT;
+	pPersist	: POINTER TO ST_CylPersist;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nId	:= nMonitorId;
+pP	:= pPersist;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Zero" Id="{7b2d0402-0000-4000-9000-000000000402}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Zero : BOOL
+// Bazowanie w biezacym polozeniu. Dozwolone tylko w trybie
+// recznym - stacja 4 robi to z paleta i wszystkimi silownikami
+// wysunietymi.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_Zero := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF eMode <> MODE_MANUAL THEN
+	RETURN;
+END_IF
+
+pP^.Mem.diZeroOffset	:= diPosRaw;
+pP^.Mem.xZeroed			:= TRUE;
+
+M_Zero := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

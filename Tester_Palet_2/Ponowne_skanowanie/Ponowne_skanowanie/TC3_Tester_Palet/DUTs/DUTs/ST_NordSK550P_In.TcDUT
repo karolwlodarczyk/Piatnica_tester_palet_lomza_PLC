@@ -1,0 +1,17 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_NordSK550P_In" Id="{819345e4-70d2-4a2b-a8f4-c7761c09f98e}">
+    <Declaration><![CDATA[TYPE ST_NordSK550P_In :
+STRUCT
+    // 0x6061
+    byModeDisplay : USINT;
+
+    // 0x6041
+    wStatusWord : UINT;
+
+    // 0x6043
+    iVelocityDemand : INT;
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

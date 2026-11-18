@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CylMem" Id="{7a1c0015-0000-4000-9000-000000000015}">
+    <Declaration><![CDATA[TYPE ST_CylMem :
+STRUCT
+	// =========================================================
+	// PAMIEC SILOWNIKA - ZMIENNE NIEULOTNE
+	// =========================================================
+
+	// Wskazanie surowe przetwornika w punkcie bazowania.
+	// Zapisuje je procedura M_Zero w trybie recznym.
+	diZeroOffset	: DINT;
+
+	// FALSE = przetwornik nigdy nie byl bazowany, progi
+	// polozenia nic nie znacza
+	xZeroed			: BOOL;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,465 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_NordSK550PP" Id="{4bc0097e-04a8-468f-9148-f54260270ffb}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_NordSK550PP
+// =============================================================
+// NORDAC PRO SK 550P
+// EtherCAT, profil NORD wg BU 2300 (NIE CiA 402)
+// =============================================================
+//
+// FB nie wykonuje ZADNYCH operacji na predkosci.
+// Zadanie jest podawane na stale, sterowanie odbywa sie
+// wylacznie bitami ControlWord. Rozpedzanie i hamowanie
+// realizuje falownik parametrami P102 / P103 / P108.
+//
+// Sterowanie przez metody:
+//   M_Start(lrFreq, xReverse)   - zadanie + bit startu
+//   M_Stop()                    - zdjecie bitu startu
+//   M_Reset()                   - kasowanie bledow
+//   M_SetFrequency(lrFreq)      - zmiana zadania
+//
+// Metody wywolywac PRZED cyklicznym wywolaniem instancji.
+VAR_INPUT
+
+	// P105 Maksymalna czestotliwosc falownika [Hz].
+	// MUSI byc rowna P105 w falowniku - inaczej skalowanie
+	// zadania jest bledne i naped dostaje inna czestotliwosc
+	// niz zadana.
+	lrFmax			: LREAL := 50.0;
+
+	// TRUE = STO zwolnione, lancuch bezpieczenstwa OK
+	xSafetyOK		: BOOL;
+
+	// TRUE = komunikacja EtherCAT sprawna
+	xEtherCAT_OK	: BOOL;
+
+	// Dane procesowe z falownika
+	stIn			: ST_NordSK550P_In;
+
+END_VAR
+VAR_OUTPUT
+
+	// Dane procesowe do falownika
+	stOut			: ST_NordSK550P_Out;
+
+
+	// =========================================================
+	// STATUS
+	// =========================================================
+
+	eState			: E_NordSK550P_State;
+
+	xReadyToSwitchOn	: BOOL;
+	xOperationEnabled	: BOOL;
+	xSwitchOnInhibit	: BOOL;
+
+	xRunning		: BOOL;
+	xStopped		: BOOL;
+
+	xFault			: BOOL;
+	xWarning		: BOOL;
+	xBusControl		: BOOL;
+
+	xError			: BOOL;
+	xCommError		: BOOL;
+
+
+	// =========================================================
+	// VALUES
+	// =========================================================
+
+	// Zadanie wysylane do falownika [Hz]
+	lrFreqSetpoint	: LREAL;
+
+	// Czestotliwosc rzeczywista z falownika [Hz]
+	lrFreqActual	: LREAL;
+
+
+	// =========================================================
+	// DIAGNOSTICS
+	// =========================================================
+
+	wStatusWord		: UINT;
+	wControlWord	: UINT;
+
+	byModeDisplay	: USINT;
+
+	//  0 = blokada, 10 = gotowosc, 20 = praca
+	nStep			: INT;
+
+END_VAR
+VAR
+
+	// Zadania z metod
+	xReqRun			: BOOL;
+	xReqReset		: BOOL;
+	xReqReverse		: BOOL;
+	lrReqFreq		: LREAL;
+
+	wStateBits		: UINT;
+	iSetpoint		: INT;
+	xBlocked		: BOOL;
+
+	tonComm			: TON;
+	tonReset		: TON;
+
+END_VAR
+VAR CONSTANT
+
+	// Skalowanie NORD: 16384 (0x4000) = 100% = P105
+	cFullScale		: LREAL := 16384.0;
+
+	// Prog zera dla czestotliwosci rzeczywistej [Hz]
+	cZeroActual		: LREAL := 0.5;
+
+	// ControlWord wg BU 2300 rozdz. 6.3.1
+	//   047E = "Shut down"        - bit 0 zdjety, falownik
+	//                               hamuje wlasna rampa P103
+	//   047F = "Enable operation" - bit 0 zalaczony
+	//   0480 = potwierdzenie bledu (bit 7)
+	cCW_Shutdown	: UINT := 16#047E;
+	cCW_EnableOp	: UINT := 16#047F;
+	cCW_AckFault	: UINT := 16#0480;
+
+	cCW_DirFwd		: UINT := 16#0800;
+	cCW_DirRev		: UINT := 16#1000;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// FB_NordSK550PP
+// NORDAC PRO SK 550P - profil NORD wg BU 2300
+// =============================================================
+//
+// ZASADA: PLC nie dotyka predkosci.
+//
+// Zadanie czestotliwosci jest podawane na stale i nie jest
+// zerowane przy zatrzymaniu. Start to zalaczenie bitu 0
+// ControlWord, stop to jego zdjecie. Reszte - rozpedzanie
+// po P102, hamowanie po P103, sposob wygaszania po P108
+// i ewentualne dohamowanie pradem stalym po P559 - robi
+// falownik.
+//
+// ControlWord (BU 2300 rozdz. 6.3.1):
+//   bit 0  Ready for operation   <-- start / stop
+//   bit 1  Voltage disable       (1 = kasuj blokade napiecia)
+//   bit 2  Quick stop            (1 = kasuj quick stop)
+//   bit 3  Enable operation
+//   bit 4  Enable pulses
+//   bit 5  Enable ramp
+//   bit 6  Setpoint enabled
+//   bit 7  Acknowledge error     (zbocze 0 -> 1)
+//   bit 10 Control data valid    <-- BEZ NIEGO NAPED IGNORUJE DANE
+//   bit 11 CW, bit 12 CCW
+//
+// StatusWord (rozdz. 6.3.2), bity 0..6:
+//   0x31 Ready to switch-on   0x33 Switched on
+//   0x37 Operation enabled    0x17 Quick stop active
+//   bit 3 Fault               bit 6 Switch-on inhibit
+//
+// Zadanie i wartosc rzeczywista sa procentowe:
+//   16384 (0x4000) = 100% = P105
+//
+// Nazwy pol diTargetVelocity / iVelocityDemand w ST_NordSK550P_*
+// sa mylace - to NIE obroty, tylko czestotliwosc w skali
+// procentowej. NIE zmieniac tych nazw: sa uzyte w linkach I/O
+// w .tsproj dla wszystkich 19 napedow.
+
+
+// =============================================================
+// COPY INPUT DATA
+// =============================================================
+
+wStatusWord		:= stIn.wStatusWord;
+byModeDisplay	:= stIn.byModeDisplay;
+
+IF lrFmax > 0.0 THEN
+	lrFreqActual := INT_TO_LREAL(stIn.iVelocityDemand) / cFullScale * lrFmax;
+ELSE
+	lrFreqActual := 0.0;
+END_IF
+
+
+// =============================================================
+// COMMUNICATION WATCHDOG
+// =============================================================
+
+tonComm(IN := NOT xEtherCAT_OK, PT := T#500MS);
+xCommError := tonComm.Q;
+
+
+// =============================================================
+// STATUSWORD DECODING
+// =============================================================
+
+xFault				:= (wStatusWord AND 16#0008) <> 0;
+xWarning			:= (wStatusWord AND 16#0080) <> 0;
+xSwitchOnInhibit	:= (wStatusWord AND 16#0040) <> 0;
+xBusControl			:= (wStatusWord AND 16#0200) <> 0;
+
+wStateBits := wStatusWord AND 16#007F;
+
+
+IF xFault THEN
+
+	IF (wStatusWord AND 16#000F) = 16#000F THEN
+		eState := NORD_STATE_FAULT_REACTION_ACTIVE;
+	ELSE
+		eState := NORD_STATE_FAULT;
+	END_IF
+
+ELSIF xSwitchOnInhibit THEN
+	eState := NORD_STATE_SWITCH_ON_DISABLED;
+
+ELSIF wStateBits = 16#0031 THEN
+	eState := NORD_STATE_READY_TO_SWITCH_ON;
+
+ELSIF wStateBits = 16#0033 THEN
+	eState := NORD_STATE_SWITCHED_ON;
+
+ELSIF wStateBits = 16#0037 THEN
+	eState := NORD_STATE_OPERATION_ENABLED;
+
+ELSIF wStateBits = 16#0017 THEN
+	eState := NORD_STATE_QUICK_STOP_ACTIVE;
+
+ELSIF (wStatusWord AND 16#000F) = 0 THEN
+	eState := NORD_STATE_NOT_READY;
+
+ELSE
+	eState := NORD_STATE_UNKNOWN;
+
+END_IF
+
+
+xReadyToSwitchOn	:= (eState = NORD_STATE_READY_TO_SWITCH_ON);
+xOperationEnabled	:= (eState = NORD_STATE_OPERATION_ENABLED);
+
+
+// =============================================================
+// WARUNKI BLOKUJACE
+// =============================================================
+
+xBlocked := xFault OR xCommError OR NOT xSafetyOK;
+xError   := xBlocked;
+
+
+// =============================================================
+// CONTROLWORD
+// =============================================================
+//
+// Trzy stany, bez zadnej sekwencji posredniej. Przejscia
+// wewnetrznej maszyny stanow falownika (Switch-on inhibit ->
+// Ready to switch-on -> Switched on -> Operation enabled)
+// realizuje sam falownik: 047E zawiera komende "Shut down",
+// a 047F jednoczesnie "Switch on" i "Enable operation".
+
+IF xBlocked THEN
+
+	nStep := 0;
+
+	// Zadanie ruchu kasujemy - po ustapieniu przyczyny naped
+	// NIE moze ruszyc sam, operator musi wywolac M_Start.
+	xReqRun := FALSE;
+
+	wControlWord := 16#0000;
+
+	// Kasowanie bledu: impuls na bicie 7
+	IF xReqReset AND xSafetyOK AND NOT xCommError THEN
+		wControlWord := cCW_AckFault;
+	END_IF
+
+ELSIF xReqRun THEN
+
+	nStep := 20;
+	wControlWord := cCW_EnableOp;
+
+	// BLOKADA ZALACZENIA (Switch-on inhibit, bit 6 statusu).
+	//
+	// Ze stanu "Switch on disabled" falownik NIE wyjdzie na 047F.
+	// Bit 0 musi zobaczyc zbocze, a zeby je zobaczyl, trzeba
+	// najpierw wyslac Shutdown (047E). Trzymanie 047F w kolko
+	// zostawia naped w blokadzie na zawsze: bez bledu, bez ruchu,
+	// bez zadnego komunikatu - dokladnie to widzielismy na
+	// napedzie 5 po przeciazeniu i na 8 po zaniku komunikacji.
+	//
+	// Dopoki falownik melduje blokade, wysylamy wiec 047E. Gdy
+	// z niej wyjdzie, w nastepnym cyklu idzie juz 047F i naped
+	// rusza sam, bez kasowania bledu i bez zdejmowania startu.
+	IF xSwitchOnInhibit THEN
+		nStep := 15;
+		wControlWord := cCW_Shutdown;
+	END_IF
+
+ELSE
+
+	nStep := 10;
+	wControlWord := cCW_Shutdown;
+
+END_IF
+
+
+// =============================================================
+// KIERUNEK
+// =============================================================
+//
+// Zmiane kierunku w ruchu obsluguje falownik - przechodzi
+// przez absolutna minimalna czestotliwosc P505.
+
+IF wControlWord <> 16#0000 THEN
+
+	IF xReqReverse THEN
+		wControlWord := wControlWord OR cCW_DirRev;
+	ELSE
+		wControlWord := wControlWord OR cCW_DirFwd;
+	END_IF
+
+END_IF
+
+
+// =============================================================
+// IMPULS KASOWANIA BLEDU
+// =============================================================
+//
+// Bit 7 musi zobaczyc zbocze 0 -> 1. Trzymamy go 200 ms,
+// potem kasujemy zadanie, zeby kolejne M_Reset znowu
+// wytworzylo zbocze.
+
+tonReset(IN := xReqReset, PT := T#200MS);
+
+IF tonReset.Q THEN
+	xReqReset := FALSE;
+END_IF
+
+
+// =============================================================
+// ZADANIE CZESTOTLIWOSCI
+// =============================================================
+//
+// Podawane na stale. NIE zerujemy go przy zatrzymaniu -
+// stop realizuje bit 0 ControlWord, a hamowanie falownik.
+
+lrFreqSetpoint := lrReqFreq;
+
+IF lrFreqSetpoint > lrFmax THEN
+	lrFreqSetpoint := lrFmax;
+END_IF
+
+IF lrFreqSetpoint < 0.0 THEN
+	lrFreqSetpoint := 0.0;
+END_IF
+
+
+IF lrFmax > 0.0 THEN
+	iSetpoint := LREAL_TO_INT(lrFreqSetpoint / lrFmax * cFullScale);
+ELSE
+	iSetpoint := 0;
+END_IF
+
+IF iSetpoint > 16384 THEN
+	iSetpoint := 16384;
+END_IF
+
+IF iSetpoint < 0 THEN
+	iSetpoint := 0;
+END_IF
+
+
+// =============================================================
+// WRITE OUTPUT PDO
+// =============================================================
+//
+// byModeOfOperation nie jest zmapowany w .tsproj - falownik
+// NORD nie uzywa obiektu 0x6060. Zostawiamy zero.
+
+stOut.byModeOfOperation	:= 0;
+stOut.wControlWord		:= wControlWord;
+stOut.diTargetVelocity	:= iSetpoint;
+
+
+// =============================================================
+// STATUS WYJSCIOWY
+// =============================================================
+
+xRunning := xOperationEnabled AND NOT xBlocked;
+
+xStopped := (ABS(lrFreqActual) <= cZeroActual);
+]]></ST>
+    </Implementation>
+    <Method Name="M_Start" Id="{a1b2c3d4-1001-4a11-9f01-11aa22bb3301}">
+      <Declaration><![CDATA[METHOD M_Start : BOOL
+VAR_INPUT
+	// Zadana czestotliwosc [Hz]
+	lrFreq		: LREAL;
+
+	// FALSE = w prawo (CW), TRUE = w lewo (CCW)
+	xReverse	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Zadanie czestotliwosci + bit startu. Nic wiecej.
+// Rozpedzanie realizuje falownik rampa P102.
+//
+// Zadanie jest zatrzaskiwane - obowiazuje az do M_Stop
+// albo do wystapienia blokady (blad / STO / komunikacja).
+
+lrReqFreq	:= lrFreq;
+xReqReverse	:= xReverse;
+xReqRun		:= TRUE;
+
+M_Start := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Stop" Id="{a1b2c3d4-1002-4a11-9f01-11aa22bb3302}">
+      <Declaration><![CDATA[METHOD M_Stop : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Zdjecie bitu 0 ControlWord. Nic wiecej - zadanie
+// czestotliwosci zostaje bez zmian.
+//
+// Falownik hamuje wlasna rampa P103, sposob wygaszania
+// okresla P108, ewentualne dohamowanie pradem stalym P559.
+
+xReqRun := FALSE;
+
+M_Stop := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Reset" Id="{a1b2c3d4-1003-4a11-9f01-11aa22bb3303}">
+      <Declaration><![CDATA[METHOD M_Reset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Kasowanie bledow falownika. FB wystawia impuls 200 ms
+// na bicie 7 ControlWord (zbocze 0 -> 1 wg BU 2300).
+//
+// Dziala tylko wtedy, gdy przyczyna blokady ustapila:
+// STO zwolnione i komunikacja sprawna.
+
+xReqReset := TRUE;
+
+M_Reset := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_SetFrequency" Id="{a1b2c3d4-1004-4a11-9f01-11aa22bb3304}">
+      <Declaration><![CDATA[METHOD M_SetFrequency : BOOL
+VAR_INPUT
+	// Zadana czestotliwosc [Hz]
+	lrFreq		: LREAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Zmiana zadania. Falownik dojezdza do nowej wartosci
+// wlasna rampa.
+
+lrReqFreq := lrFreq;
+
+M_SetFrequency := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

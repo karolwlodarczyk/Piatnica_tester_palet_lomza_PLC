@@ -1,0 +1,19 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="E_NordSK550P_State" Id="{9c193a37-bfe1-4239-a7e6-3d65917de998}">
+    <Declaration><![CDATA[TYPE E_NordSK550P_State :
+(
+    NORD_STATE_NOT_READY,
+    NORD_STATE_SWITCH_ON_DISABLED,
+    NORD_STATE_READY_TO_SWITCH_ON,
+    NORD_STATE_SWITCHED_ON,
+    NORD_STATE_OPERATION_ENABLED,
+    NORD_STATE_QUICK_STOP_ACTIVE,
+    NORD_STATE_FAULT_REACTION_ACTIVE,
+    NORD_STATE_FAULT,
+    NORD_STATE_UNKNOWN
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

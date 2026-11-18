@@ -1,0 +1,671 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_Cylinder" Id="{7b2d0300-0000-4000-9000-000000000300}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Cylinder
+// =============================================================
+// SILOWNIK PNEUMATYCZNY
+// =============================================================
+//
+// Jeden blok na wszystkie silowniki maszyny - blokade stacji 5,
+// szczeki, silowniki rozrywajace, dociski stacji 4, podnoszenie
+// rolek na stacjach 8 i 10. Roznice siedza w nastawach, nie
+// w kodzie.
+//
+// -------------------------------------------------------------
+// ZAWORY
+// -------------------------------------------------------------
+// Blok wystawia dwie cewki: xCoilExtend i xCoilRetract. Stacja
+// przepisuje je na swoje wyjscia. Sposob ich uzycia zalezy od
+// typu zaworu (E_CylValve) - monostabilny uzywa tylko pierwszej,
+// 3-polozeniowy w spoczynku ma zdjete obie.
+//
+// -------------------------------------------------------------
+// SPRZEZENIE
+// -------------------------------------------------------------
+// Trzy warianty: brak, krancowki, przetwornik IO-Link o wartosci
+// bezwzglednej. Przy przetworniku polozenia koncowe to PROGI
+// nastawiane przez operatora, liczone wzgledem punktu bazowania.
+//
+// Obserwacje polozenia mozna wylaczyc OSOBNO dla kazdego
+// kierunku i zastapic czasowka - tryb pracy z uszkodzonym
+// czujnikiem. Tak samo watchdog: silownik bez krancowki na
+// jednym koncu nie ma jak potwierdzic dojazdu, wiec watchdog
+// w tym kierunku musi dac sie wylaczyc.
+//
+// -------------------------------------------------------------
+// PRZEKROCZENIE PROGU
+// -------------------------------------------------------------
+// xOverLimit NIE JEST ALARMEM SILOWNIKA. To wynik testu:
+// silownik wysunal sie dalej, niz moglby z cala paleta, czyli
+// deska pekla albo odpadla. Decyzje podejmuje stacja.
+VAR_INPUT
+
+	eMode			: E_MachineMode;
+	xSafetyOK		: BOOL;
+
+	// Krancowki - logika dodatnia (TRUE = czujnik zadziala)
+	xSwExtRaw		: BOOL;
+	xSwRetRaw		: BOOL;
+
+	// Surowe wskazanie przetwornika IO-Link
+	diPosRaw		: DINT;
+
+	// Sprzezenie z zewnatrz (CYLFB_EXTERNAL). Stacja 4 steruje
+	// grupami silownikow jednym zaworem, a mierzy kazdy osobno -
+	// agreguje wskazania monitorow i podaje wynik tutaj.
+	xFbExtIn		: BOOL;
+	xFbRetIn		: BOOL;
+
+END_VAR
+VAR_OUTPUT
+
+	// Cewki zaworu - stacja przepisuje je na swoje wyjscia
+	xCoilExtend		: BOOL;
+	xCoilRetract	: BOOL;
+
+	eState			: E_CylState;
+	eAlarm			: E_CylAlarm;
+	xAlarm			: BOOL;
+
+	// Potwierdzone polozenia koncowe
+	xExtended		: BOOL;
+	xRetracted		: BOOL;
+	xMoving			: BOOL;
+
+	// Polozenie wzgledem punktu bazowania
+	diPos			: DINT;
+
+	// Przekroczenie progu = deska pekla / odpadla
+	xOverLimit		: BOOL;
+
+	// Nacisk utrzymany przez nastawiony czas (stacja 5)
+	xHoldDone		: BOOL;
+
+END_VAR
+VAR
+
+	nCylId			: INT;
+	pP				: POINTER TO ST_CylPersist;
+
+	// Zadanie: TRUE = wysuw
+	xReqExtend		: BOOL;
+	xCmdIssued		: BOOL;
+
+	// Sprzezenie po odfiltrowaniu wylaczen
+	xFbExtended		: BOOL;
+	xFbRetracted	: BOOL;
+	xFbConflict		: BOOL;
+
+	tonDelay		: TON;
+	tonWatchdog		: TON;
+	tonSubst		: TON;
+	tonSettle		: TON;
+	tonHold			: TON;
+
+	eModeOld		: E_MachineMode;
+
+	xManExtend		: BOOL;
+	xManRetract		: BOOL;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL SILOWNIKA
+// =============================================================
+
+
+// -------------------------------------------------------------
+// 1. KONFIGURACJA
+// -------------------------------------------------------------
+
+IF pP = 0 THEN
+	M_Deenergize();
+	eAlarm	:= ALM_CYL_NOT_CONFIGURED;
+	xAlarm	:= TRUE;
+	eState	:= CYL_ALARM;
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 2. POLOZENIE I SPRZEZENIE
+// -------------------------------------------------------------
+
+M_ReadPosition();
+M_EvalFeedback();
+
+// Potwierdzone polozenia koncowe bierzemy ze STANU, nie wprost
+// z czujnika. Dzieki temu dzialaja tak samo wtedy, gdy operator
+// wylaczyl obserwacje czujnika i ruch potwierdza czasowka.
+xExtended	:= (eState = CYL_EXTENDED);
+xRetracted	:= (eState = CYL_RETRACTED);
+xAlarm		:= (eAlarm <> ALM_CYL_NONE);
+
+
+// -------------------------------------------------------------
+// 3. NIEZGODNOSC KRANCOWEK
+// -------------------------------------------------------------
+
+tonSettle(IN := xFbConflict, PT := pP^.Cfg.tSettle);
+
+IF tonSettle.Q THEN
+	M_RaiseAlarm(eNew := ALM_CYL_BOTH_SWITCHES);
+END_IF
+
+
+// -------------------------------------------------------------
+// 4. ZEZWOLENIE BEZPIECZENSTWA
+// -------------------------------------------------------------
+//
+// Cewki zostaja tam, gdzie byly - zdjecie ich przy zaworze
+// monostabilnym cofneloby silownik, a to przy zamknietych
+// szczekach na palecie nie jest bezpieczne. Ruch stoi,
+// watchdog jest wyzerowany i po powrocie zezwolenia liczy
+// od poczatku.
+
+IF NOT xSafetyOK THEN
+	xMoving := FALSE;
+	tonWatchdog(IN := FALSE);
+	tonSubst(IN := FALSE);
+	tonDelay(IN := FALSE);
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 5. TRYB RECZNY
+// -------------------------------------------------------------
+
+IF eMode = MODE_MANUAL THEN
+	eModeOld := eMode;
+	M_ManualCycle();
+	RETURN;
+END_IF
+
+IF eModeOld = MODE_MANUAL THEN
+	// Po recznej nie wiemy, gdzie operator zostawil silownik
+	eState := CYL_UNKNOWN;
+END_IF
+
+eModeOld := eMode;
+
+
+// -------------------------------------------------------------
+// 6. ALARM
+// -------------------------------------------------------------
+
+IF xAlarm THEN
+	xMoving	:= FALSE;
+	eState	:= CYL_ALARM;
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 7. SEKWENCJA
+// -------------------------------------------------------------
+
+CASE eState OF
+
+CYL_UNKNOWN:
+	xMoving := FALSE;
+
+	IF NOT xCmdIssued THEN
+		// Bez komendy nie ruszamy - nie wiadomo, co stoi na drodze
+		RETURN;
+	END_IF
+
+	M_BeginMove(xExt := xReqExtend);
+
+
+CYL_RETRACTED:
+	xMoving := FALSE;
+	M_ApplyCoils(xExt := FALSE);
+
+	IF xReqExtend THEN
+		M_BeginMove(xExt := TRUE);
+	END_IF
+
+
+CYL_EXTENDING:
+	xMoving := TRUE;
+	M_MoveCycle(xExt := TRUE);
+
+
+CYL_EXTENDED:
+	xMoving := FALSE;
+	M_ApplyCoils(xExt := TRUE);
+
+	IF NOT xReqExtend THEN
+		M_BeginMove(xExt := FALSE);
+	END_IF
+
+
+CYL_RETRACTING:
+	xMoving := TRUE;
+	M_MoveCycle(xExt := FALSE);
+
+
+CYL_ALARM:
+	xMoving := FALSE;
+
+
+ELSE
+	eState := CYL_UNKNOWN;
+
+END_CASE
+
+
+// Odswiezenie po zmianie stanu w tym cyklu
+xExtended	:= (eState = CYL_EXTENDED);
+xRetracted	:= (eState = CYL_RETRACTED);
+
+
+// -------------------------------------------------------------
+// 8. TEST TRZYMANIA NACISKU
+// -------------------------------------------------------------
+//
+// Liczymy czas dopiero od momentu, w ktorym silownik przekroczyl
+// zaprogramowana pozycje. Kazdy silownik ma wlasny licznik, bo
+// wszystkie ida z inna predkoscia.
+
+IF pP^.Cfg.eFeedback = CYLFB_ANALOG THEN
+	tonHold(IN := (diPos >= pP^.Cfg.diPosHoldStart), PT := pP^.Cfg.tHold);
+	xHoldDone := tonHold.Q;
+ELSE
+	tonHold(IN := FALSE);
+	xHoldDone := FALSE;
+END_IF
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_Config" Id="{7b2d0301-0000-4000-9000-000000000301}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Config
+VAR_INPUT
+	nId			: INT;
+	pPersist	: POINTER TO ST_CylPersist;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nCylId	:= nId;
+pP		:= pPersist;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Extend" Id="{7b2d0302-0000-4000-9000-000000000302}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Extend : BOOL
+// Zadanie wysuwu. Zatrzaskiwane - obowiazuje az do M_Retract.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xReqExtend	:= TRUE;
+xCmdIssued	:= TRUE;
+M_Extend	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Retract" Id="{7b2d0303-0000-4000-9000-000000000303}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Retract : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xReqExtend	:= FALSE;
+xCmdIssued	:= TRUE;
+M_Retract	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManJog" Id="{7b2d0304-0000-4000-9000-000000000304}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ManJog
+// Komendy trybu recznego. Dzialaja tylko w MODE_MANUAL.
+VAR_INPUT
+	xExt	: BOOL;
+	xRet	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xManExtend	:= xExt;
+xManRetract	:= xRet;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Zero" Id="{7b2d0305-0000-4000-9000-000000000305}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Zero : BOOL
+// Bazowanie przetwornika w BIEZACYM polozeniu.
+//
+// Stacja 4: wstawiamy palete, wysuwamy wszystkie silowniki
+// i zerujemy - punkt bazowy jest na silowniku WYSUNIETYM.
+// Stacja 5: zerujemy na silowniku WYCOFANYM, bez palety.
+//
+// Dozwolone tylko w trybie recznym.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_Zero := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF eMode <> MODE_MANUAL THEN
+	RETURN;
+END_IF
+
+IF pP^.Cfg.eFeedback <> CYLFB_ANALOG THEN
+	RETURN;
+END_IF
+
+pP^.Mem.diZeroOffset	:= diPosRaw;
+pP^.Mem.xZeroed			:= TRUE;
+
+M_Zero := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d0306-0000-4000-9000-000000000306}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[eAlarm	:= ALM_CYL_NONE;
+xAlarm	:= FALSE;
+
+tonWatchdog(IN := FALSE);
+tonSubst(IN := FALSE);
+tonDelay(IN := FALSE);
+tonSettle(IN := FALSE);
+
+eState	:= CYL_UNKNOWN;
+M_Reset	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ReadPosition" Id="{7b2d0307-0000-4000-9000-000000000307}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ReadPosition
+// Przeliczenie wskazania surowego na polozenie wzgledem bazy.
+// Znak dodatni zawsze w kierunku wysuwu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pP^.Cfg.eFeedback <> CYLFB_ANALOG THEN
+	diPos := 0;
+	RETURN;
+END_IF
+
+IF pP^.Cfg.xInvertPos THEN
+	diPos := pP^.Mem.diZeroOffset - diPosRaw;
+	RETURN;
+END_IF
+
+diPos := diPosRaw - pP^.Mem.diZeroOffset;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_EvalFeedback" Id="{7b2d0308-0000-4000-9000-000000000308}">
+      <Declaration><![CDATA[METHOD PROTECTED M_EvalFeedback
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xOverLimit := FALSE;
+
+CASE pP^.Cfg.eFeedback OF
+
+CYLFB_SWITCHES:
+	xFbExtended		:= xSwExtRaw;
+	xFbRetracted	:= xSwRetRaw;
+	xFbConflict		:= xSwExtRaw AND xSwRetRaw;
+
+CYLFB_ANALOG:
+	xFbExtended		:= (diPos >= pP^.Cfg.diPosExtended);
+	xFbRetracted	:= (diPos <= pP^.Cfg.diPosRetracted);
+	xFbConflict		:= FALSE;
+	xOverLimit		:= (diPos > pP^.Cfg.diPosLimit);
+
+CYLFB_EXTERNAL:
+	xFbExtended		:= xFbExtIn;
+	xFbRetracted	:= xFbRetIn;
+	xFbConflict		:= xFbExtIn AND xFbRetIn;
+
+ELSE
+	// CYLFB_NONE - ruch wylacznie na czasowkach
+	xFbExtended		:= FALSE;
+	xFbRetracted	:= FALSE;
+	xFbConflict		:= FALSE;
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_BeginMove" Id="{7b2d0309-0000-4000-9000-000000000309}">
+      <Declaration><![CDATA[METHOD PROTECTED M_BeginMove
+VAR_INPUT
+	xExt	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[tonDelay(IN := FALSE);
+tonWatchdog(IN := FALSE);
+tonSubst(IN := FALSE);
+
+IF xExt THEN
+	eState := CYL_EXTENDING;
+	RETURN;
+END_IF
+
+eState := CYL_RETRACTING;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MoveCycle" Id="{7b2d030a-0000-4000-9000-00000000030a}">
+      <Declaration><![CDATA[METHOD PROTECTED M_MoveCycle
+// Jeden ruch: opoznienie -> wysterowanie zaworu ->
+// potwierdzenie konca -> watchdog.
+VAR_INPUT
+	xExt		: BOOL;
+END_VAR
+VAR
+	tDelay		: TIME;
+	tSubst		: TIME;
+	tWd			: TIME;
+	xFbUsed		: BOOL;
+	xFbReached	: BOOL;
+	xWdEnabled	: BOOL;
+	xDone		: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// ---------------------------------------------------------
+// Nastawy dla biezacego kierunku
+// ---------------------------------------------------------
+
+IF xExt THEN
+	tDelay		:= pP^.Cfg.tExtendDelay;
+	tSubst		:= pP^.Cfg.tExtendSubst;
+	tWd			:= pP^.Cfg.tExtendWatchdog;
+	xFbUsed		:= pP^.Cfg.xExtendFbEnabled;
+	xWdEnabled	:= pP^.Cfg.xExtendWdEnabled;
+	xFbReached	:= xFbExtended;
+ELSE
+	tDelay		:= pP^.Cfg.tRetractDelay;
+	tSubst		:= pP^.Cfg.tRetractSubst;
+	tWd			:= pP^.Cfg.tRetractWatchdog;
+	xFbUsed		:= pP^.Cfg.xRetractFbEnabled;
+	xWdEnabled	:= pP^.Cfg.xRetractWdEnabled;
+	xFbReached	:= xFbRetracted;
+END_IF
+
+
+// ---------------------------------------------------------
+// Opoznienie wysterowania zaworu
+// ---------------------------------------------------------
+//
+// W tej fazie NIE ruszamy cewek - silownik zostaje tam,
+// gdzie byl. Zdjecie cewki zaworu monostabilnego cofneloby
+// go, a o to nam nie chodzi.
+
+tonDelay(IN := TRUE, PT := tDelay);
+
+IF NOT tonDelay.Q THEN
+	RETURN;
+END_IF
+
+
+// ---------------------------------------------------------
+// Wysterowanie zaworu
+// ---------------------------------------------------------
+
+M_ApplyCoils(xExt := xExt);
+
+
+// ---------------------------------------------------------
+// Potwierdzenie konca ruchu
+// ---------------------------------------------------------
+//
+// Sprzezenie wylaczone przez operatora = uznajemy ruch za
+// wykonany po uplywie czasowki zastepczej.
+
+IF xFbUsed THEN
+	tonSubst(IN := FALSE);
+	xDone := xFbReached;
+ELSE
+	tonSubst(IN := TRUE, PT := tSubst);
+	xDone := tonSubst.Q;
+END_IF
+
+
+IF xDone THEN
+	tonWatchdog(IN := FALSE);
+	tonSubst(IN := FALSE);
+	tonDelay(IN := FALSE);
+
+	IF xExt THEN
+		eState := CYL_EXTENDED;
+	ELSE
+		eState := CYL_RETRACTED;
+	END_IF
+
+	RETURN;
+END_IF
+
+
+// ---------------------------------------------------------
+// Watchdog
+// ---------------------------------------------------------
+//
+// Wylaczalny osobno dla kierunku bez krancowki.
+
+tonWatchdog(IN := xWdEnabled, PT := tWd);
+
+IF NOT tonWatchdog.Q THEN
+	RETURN;
+END_IF
+
+IF xExt THEN
+	M_RaiseAlarm(eNew := ALM_CYL_EXTEND_TIMEOUT);
+	RETURN;
+END_IF
+
+M_RaiseAlarm(eNew := ALM_CYL_RETRACT_TIMEOUT);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ApplyCoils" Id="{7b2d030b-0000-4000-9000-00000000030b}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ApplyCoils
+VAR_INPUT
+	xExt	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE pP^.Cfg.eValve OF
+
+CYLV_SINGLE:
+	// Jedna cewka, powrot sprezyna
+	xCoilExtend		:= xExt;
+	xCoilRetract	:= FALSE;
+
+CYLV_3POS_OFF_RET:
+	// Cofniecie realizuje zdjecie cewek
+	xCoilExtend		:= xExt;
+	xCoilRetract	:= FALSE;
+
+ELSE
+	// CYLV_DOUBLE i CYLV_3POS_MID - cewki wykluczajace sie
+	xCoilExtend		:= xExt;
+	xCoilRetract	:= NOT xExt;
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Deenergize" Id="{7b2d030c-0000-4000-9000-00000000030c}">
+      <Declaration><![CDATA[METHOD PROTECTED M_Deenergize
+// Zdjecie obu cewek. Przy zaworze 3-polozeniowym to jest
+// polozenie spoczynkowe, przy monostabilnym powrot sprezyna.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xCoilExtend		:= FALSE;
+xCoilRetract	:= FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_RaiseAlarm" Id="{7b2d030d-0000-4000-9000-00000000030d}">
+      <Declaration><![CDATA[METHOD PROTECTED M_RaiseAlarm
+// Pierwszy alarm zostaje - operator ma widziec przyczyne.
+VAR_INPUT
+	eNew	: E_CylAlarm;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF eNew = ALM_CYL_NONE THEN
+	RETURN;
+END_IF
+
+IF eAlarm = ALM_CYL_NONE THEN
+	eAlarm := eNew;
+END_IF
+
+xAlarm	:= TRUE;
+eState	:= CYL_ALARM;
+xMoving	:= FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManualCycle" Id="{7b2d030e-0000-4000-9000-00000000030e}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ManualCycle
+// Praca reczna: sterowanie cewkami wprost, bez watchdogow
+// i bez czasowek. Sluzy takze do bazowania przetwornikow.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[eState := CYL_MANUAL;
+
+tonWatchdog(IN := FALSE);
+tonSubst(IN := FALSE);
+tonDelay(IN := FALSE);
+
+IF xManExtend AND NOT xManRetract THEN
+	M_ApplyCoils(xExt := TRUE);
+	xMoving := TRUE;
+	RETURN;
+END_IF
+
+IF xManRetract AND NOT xManExtend THEN
+	M_ApplyCoils(xExt := FALSE);
+	xMoving := TRUE;
+	RETURN;
+END_IF
+
+xMoving := FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

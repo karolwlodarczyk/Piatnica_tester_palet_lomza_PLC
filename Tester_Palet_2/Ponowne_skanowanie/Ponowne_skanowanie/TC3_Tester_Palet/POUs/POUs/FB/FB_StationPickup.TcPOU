@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_StationPickup" Id="{7b2d0a00-0000-4000-9000-000000000a00}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_StationPickup EXTENDS FB_RollerConveyor
+// =============================================================
+// STACJA ODBIORU - 13 (stosy dobre) I 16 (palety odrzucone)
+// =============================================================
+//
+// Koniec drogi: ladunek stoi na czujnikach i zabiera go operator.
+// Nie ma nastepnika, wiec zwolnienie miejsca musi wykryc sama
+// stacja.
+//
+// Dwa sposoby, przelaczane nastawa Cfg.xPickupByButton:
+//
+//   TRUE  - operator potwierdza przyciskiem. Sprawdzamy wtedy,
+//           czy ladunek faktycznie zniknal z czujnikow. Jesli
+//           nie zniknal, nie robimy nic - przycisk nie jest
+//           dowodem na to, ze cos zostalo zabrane.
+//
+//   FALSE - miejsce uznajemy za wolne po Cfg.tPickupTimeout
+//           od zniknieca ladunku z czujnikow.
+VAR_INPUT
+
+	// Przycisk operatora "zabralem"
+	xPickupButton	: BOOL;
+
+END_VAR
+VAR_OUTPUT
+
+	// Czeka na odbior
+	xWaitingPickup	: BOOL;
+
+END_VAR
+VAR
+
+	tonPickup	: TON;
+	rtrgButton	: R_TRIG;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[SUPER^();
+
+M_PickupCycle();
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_PickupCycle" Id="{7b2d0a01-0000-4000-9000-000000000a01}">
+      <Declaration><![CDATA[METHOD PROTECTED M_PickupCycle
+VAR
+	xFree	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xWaitingPickup := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF NOT pP^.Mem.xLoadPresent THEN
+	tonPickup(IN := FALSE);
+	rtrgButton(CLK := xPickupButton);
+	RETURN;
+END_IF
+
+xWaitingPickup	:= TRUE;
+eWait			:= WAIT_PICKUP;
+
+
+// Pole czujnikow wolne. Przy wylaczonych czujnikach nie mamy
+// czym tego stwierdzic - wtedy decyduje sam przycisk.
+IF xSensUsable THEN
+	xFree := xSensLoadNone;
+ELSE
+	xFree := TRUE;
+END_IF
+
+
+// --- potwierdzenie przyciskiem ---
+IF pP^.Cfg.xPickupByButton THEN
+
+	rtrgButton(CLK := xPickupButton);
+
+	IF NOT rtrgButton.Q THEN
+		RETURN;
+	END_IF
+
+	// Przycisk wcisniety, ale ladunek dalej lezy - nic nie robimy
+	IF NOT xFree THEN
+		RETURN;
+	END_IF
+
+	M_ClearLoad();
+	RETURN;
+
+END_IF
+
+
+// --- odliczanie od zniknieca z czujnikow ---
+rtrgButton(CLK := xPickupButton);
+
+tonPickup(IN := xFree, PT := pP^.Cfg.tPickupTimeout);
+
+IF tonPickup.Q THEN
+	tonPickup(IN := FALSE);
+	M_ClearLoad();
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationRequired" Id="{7b2d0a02-0000-4000-9000-000000000a02}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationRequired : BOOL
+// Nie ma operacji technologicznej - ladunek po prostu czeka.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationRequired := FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

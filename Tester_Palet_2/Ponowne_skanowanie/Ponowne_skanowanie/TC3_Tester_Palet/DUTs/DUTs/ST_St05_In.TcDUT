@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_St05_In" Id="{7a1c0021-0000-4000-9000-000000000021}">
+    <Declaration><![CDATA[TYPE ST_St05_In :
+STRUCT
+	// =========================================================
+	// STACJA 5 - SYGNALY WEJSCIOWE
+	// =========================================================
+	//
+	// Cale mapowanie z GVL siedzi w jednym miejscu w MAIN.
+	// Blok stacji nie siega do GVL bezposrednio.
+
+	// Blokada punktu zatrzymania - czujniki gorny i dolny
+	xBlockUpSw		: BOOL;
+	xBlockDownSw	: BOOL;
+
+	// Silownik podnoszenia szczek - czujniki po obu stronach
+	xJawLiftUpSw	: BOOL;
+	xJawLiftDownSw	: BOOL;
+
+	// Czujniki otwarcia szczek. Trzy pary po dwa silowniki,
+	// para obsluguje jedna dolna deske palety. Para jest
+	// otwarta dopiero gdy OBA silowniki zglaszaja otwarcie -
+	// tylko wtedy wolno wjechac i wyjechac paleta.
+	axJawOpenSw		: ARRAY[1..3, 1..2] OF BOOL;
+
+	// Przetworniki polozenia silownikow rozrywajacych,
+	// indeksowane NUMEREM SILOWNIKA 1..6 (nie numerem zaworu)
+	adiPullPos		: ARRAY[1..6] OF DINT;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

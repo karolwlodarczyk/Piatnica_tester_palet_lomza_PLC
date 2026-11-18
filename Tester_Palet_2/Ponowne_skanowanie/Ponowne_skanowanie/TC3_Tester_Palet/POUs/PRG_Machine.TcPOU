@@ -1,0 +1,900 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="PRG_Machine" Id="{3723006f-8e56-479b-b982-5b261f2b7001}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM PRG_Machine
+// =============================================================
+// TESTER PALET - PELNA APLIKACJA (CHWILOWO NIEWYWOLYWANA)
+// =============================================================
+//
+// Ten program NIE jest wolany z zadania. MAIN wykonuje teraz
+// wylacznie test ruchu transporterow. Zeby wrocic do pelnej
+// aplikacji, wystarczy w MAIN wywolac PRG_Machine() zamiast
+// akcji testowych.
+// =============================================================
+// =============================================================
+//
+// Wszystkie bity, ktore trzeba podlinkowac albo przestawiac
+// online, siedza W TYM PROGRAMIE, na gorze deklaracji. Nie
+// trzeba ich szukac po blokach.
+//
+// -------------------------------------------------------------
+// CZYM SIE ROZNI OD WERSJI DOCELOWEJ
+// -------------------------------------------------------------
+//   - czujniki pracuja w logice WPROST: 1 = jest paleta
+//     (docelowo bedzie odwrotnie, przelacza to jeden bit
+//     w nastawach kazdej stacji)
+//   - stacje bez czujnikow jada na czasowki
+//   - silowniki nie maja czujnikow polozenia - kazdy ruch
+//     jest potwierdzany czasowka
+//   - czestotliwosc wszystkich falownikow 15 Hz
+//   - przejazd bez zatrzymania wylaczony na wszystkich stacjach
+//   - werdykt OK / NOK wystawia licznik: co piata paleta NOK
+//
+// ACT_Config nadpisuje nastawy nieulotne przy kazdym starcie
+// sterownika. W wersji docelowej ta akcja znika i nastawy
+// zostaja pod kontrola operatora.
+VAR
+
+	// =========================================================
+	// 1. STEROWANIE - DO ZMIANY ONLINE
+	// =========================================================
+
+	// Tryb pracy maszyny
+	eMode				: E_MachineMode := MODE_AUTO;
+
+	// Zezwolenie z lancucha bezpieczenstwa.
+	// Na czas uruchomienia mozna trzymac TRUE z palca.
+	xSafetyOK			: BOOL := TRUE;
+
+	// RECZNE ZEZWOLENIE NA PRZEJAZDY MIEDZY STACJAMI.
+	// FALSE zatrzymuje wydawanie ladunkow - maszyna stoi tam,
+	// gdzie jest, i nic sie nie przesuwa dalej.
+	xTransferEnable		: BOOL := TRUE;
+
+	// Operator wstawil stos na stacje 1.
+	// Czujnik stacji 1 nie widzi stosu, wiec informacje
+	// podajemy tym bitem - dziala na zbocze.
+	xCmdStackInserted	: BOOL;
+
+	// Kasowanie alarmow wszystkich stacji - zbocze
+	xCmdReset			: BOOL;
+
+	// RESET MASZYNY DO STANU ZEROWEGO - zbocze.
+	// Kasuje pamiec obecnosci na wszystkich stacjach oraz
+	// liczniki desztaplarki i sztaplarki. Do uzycia, gdy
+	// maszyne trzeba oproznic recznie.
+	xCmdClearMachine	: BOOL;
+
+
+	// =========================================================
+	// 2. CZUJNIKI - DO PODLINKOWANIA
+	// =========================================================
+	//
+	// Logika WPROST: 0 = nie ma palety, 1 = jest paleta.
+
+	xSens_St01			: BOOL;		// stacja 1
+	xSens_St03			: BOOL;		// stacja 3
+	xSens_St04_Entry	: BOOL;		// stacja 4 - wjazd palety
+	xSens_St04_Stop		: BOOL;		// stacja 4 - pozycja koncowa
+	xSens_St07			: BOOL;		// stacja 7
+	xSens_St11			: BOOL;		// stacja 11
+	xSens_St13			: BOOL;		// stacja 13
+	xSens_St16			: BOOL;		// stacja 16
+
+	// Enkodery absolutne wozkow. Pozycje robocze wpisujemy
+	// z palca w ACT_Config - patrz sekcja DESZTAPLARKA.
+	diEnc_St03			: DINT;
+	diEnc_St11			: DINT;
+
+
+	// =========================================================
+	// 3. WYJSCIA SZCZEK - DO PODLINKOWANIA
+	// =========================================================
+
+	xOut_St03_JawClose	: BOOL;
+	xOut_St03_JawOpen	: BOOL;
+	xOut_St11_JawClose	: BOOL;
+	xOut_St11_JawOpen	: BOOL;
+
+
+	// =========================================================
+	// 4. STACJE
+	// =========================================================
+
+	fbSt01	: FB_RollerConveyor;
+	fbSt02	: FB_RollerConveyor;
+	fbSt03	: FB_Station03_Destack;
+	fbSt04	: FB_Station04_Press;
+	fbSt05	: FB_Station05_Tear;
+	fbSt06	: FB_RollerConveyor;
+	fbSt07	: FB_RollerConveyor;
+	fbSt08	: FB_RollerConveyor;
+	fbSt09	: FB_RollerConveyor;
+	fbSt10	: FB_RollerConveyor;
+	fbSt11	: FB_Station11_Stack;
+	fbSt12	: FB_RollerConveyor;
+	fbSt13	: FB_StationPickup;
+	fbSt14	: FB_RollerConveyor;
+	fbSt15	: FB_RollerConveyor;
+	fbSt16	: FB_StationPickup;
+
+	// Wskazniki na wezly - do podpinania sasiadow i do resetu
+	aNode	: ARRAY[1..16] OF POINTER TO FB_TransportNodeBase;
+
+
+	// =========================================================
+	// 5. NAPEDY
+	// =========================================================
+
+	fbNord	: ARRAY[1..20] OF FB_NordSK550PP;
+
+	// Lustro diagnostyczne napedow
+	aeDrvState		: ARRAY[1..20] OF E_NordSK550P_State;
+	axDrvRunning	: ARRAY[1..20] OF BOOL;
+	axDrvError		: ARRAY[1..20] OF BOOL;
+	alrDrvFreqAct	: ARRAY[1..20] OF LREAL;
+
+
+	// =========================================================
+	// 6. DIAGNOSTYKA STACJI - PODGLAD ONLINE
+	// =========================================================
+
+	aeState		: ARRAY[1..16] OF E_NodeState;
+	aeWait		: ARRAY[1..16] OF E_WaitCause;
+	aeAlarm		: ARRAY[1..16] OF E_NodeAlarm;
+	axOccupied	: ARRAY[1..16] OF BOOL;
+	axNok		: ARRAY[1..16] OF BOOL;
+
+	// Licznik palet i werdykty
+	nPalletsDone	: INT;
+	nOkCount		: INT;
+	nNokCount		: INT;
+
+
+	// =========================================================
+	// 7. WEWNETRZNE
+	// =========================================================
+
+	xInit		: BOOL;
+	i			: INT;
+
+	rtrgStack	: R_TRIG;
+	rtrgReset	: R_TRIG;
+	rtrgClear	: R_TRIG;
+	rtrgSt05	: R_TRIG;
+
+	nLoadSeq	: UDINT;
+
+END_VAR
+VAR CONSTANT
+
+	// P105 falownikow
+	cFmax		: LREAL := 50.0;
+
+	// Liczba falownikow zmapowanych w .tsproj
+	cNumDrives	: INT := 19;
+
+	// Czestotliwosc robocza wersji testowej
+	cTestFreq	: LREAL := 15.0;
+
+	// Co ktora paleta ma byc uznana za NOK
+	cNokEvery	: INT := 5;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// MAIN - TESTER PALET
+// =============================================================
+//
+// Kolejnosc jest czescia kontraktu: najpierw stacje, bo wolaja
+// metody blokow napedu, dopiero potem same napedy.
+
+
+// Jednorazowa konfiguracja
+ACT_Config();
+
+// Komendy operatora
+ACT_Commands();
+
+// Stacje
+ACT_Stations();
+
+// Test: werdykt OK / NOK i trasowanie na stacji 8
+ACT_Verdict();
+
+// Napedy
+ACT_Drives();
+
+// Podglad
+ACT_Diag();
+]]></ST>
+    </Implementation>
+
+    <Action Name="ACT_Config" Id="{4a10d001-0000-4000-9000-00000000d001}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Config
+// Konfiguracja jednorazowa - WERSJA TESTOWA
+// =============================================================
+//
+// Ta akcja NADPISUJE nastawy nieulotne przy kazdym starcie
+// sterownika. Tak ma byc na czas uruchomienia: chcemy miec
+// pewnosc, od czego zaczynamy. W wersji docelowej ta akcja
+// znika, a nastawy zostaja pod kontrola operatora.
+
+IF xInit THEN
+	RETURN;
+END_IF
+
+xInit := TRUE;
+
+
+// -------------------------------------------------------------
+// WSKAZNIKI NA WEZLY
+// -------------------------------------------------------------
+
+aNode[1]  := ADR(fbSt01);
+aNode[2]  := ADR(fbSt02);
+aNode[3]  := ADR(fbSt03);
+aNode[4]  := ADR(fbSt04);
+aNode[5]  := ADR(fbSt05);
+aNode[6]  := ADR(fbSt06);
+aNode[7]  := ADR(fbSt07);
+aNode[8]  := ADR(fbSt08);
+aNode[9]  := ADR(fbSt09);
+aNode[10] := ADR(fbSt10);
+aNode[11] := ADR(fbSt11);
+aNode[12] := ADR(fbSt12);
+aNode[13] := ADR(fbSt13);
+aNode[14] := ADR(fbSt14);
+aNode[15] := ADR(fbSt15);
+aNode[16] := ADR(fbSt16);
+
+
+// -------------------------------------------------------------
+// NASTAWY WSPOLNE
+// -------------------------------------------------------------
+
+FOR i := 1 TO 16 DO
+
+	GVL_PERSIST.aConv[i].Cfg.lrFreqAuto			:= cTestFreq;
+	GVL_PERSIST.aConv[i].Cfg.lrFreqManual		:= cTestFreq;
+	GVL_PERSIST.aConv[i].Cfg.tStopDelay			:= T#150MS;
+
+	// Wersja testowa: 1 = jest paleta
+	GVL_PERSIST.aConv[i].Cfg.xSensorsInverted	:= FALSE;
+
+	GVL_PERSIST.aConv[i].Cfg.tSensorSettle		:= T#1S;
+	GVL_PERSIST.aConv[i].Cfg.tInfeedWatchdog	:= T#40S;
+	GVL_PERSIST.aConv[i].Cfg.tOutfeedWatchdog	:= T#40S;
+	GVL_PERSIST.aConv[i].Cfg.tBlindTravel		:= T#5S;
+	GVL_PERSIST.aConv[i].Cfg.tClearDelay		:= T#500MS;
+
+	GVL_PERSIST.aConv[i].Cfg.xStationEnabled	:= TRUE;
+	GVL_PERSIST.aConv[i].Cfg.nResumeRetries		:= 1;
+
+	// Na czas uruchomienia kazda paleta zatrzymuje sie na
+	// kazdej stacji - latwiej obserwowac
+	GVL_PERSIST.aConv[i].Cfg.xAllowPassThrough	:= FALSE;
+
+	// Domyslnie oba czujniki wylaczone, czyli przejazd na
+	// czasowke. Ponizej wlaczamy tylko te, ktore istnieja.
+	GVL_PERSIST.aConv[i].Cfg.xSensor1Enabled	:= FALSE;
+	GVL_PERSIST.aConv[i].Cfg.xSensor2Enabled	:= FALSE;
+	GVL_PERSIST.aConv[i].Cfg.xInvertDirection	:= FALSE;
+
+END_FOR
+
+
+// -------------------------------------------------------------
+// CZUJNIKI, KTORE ISTNIEJA
+// -------------------------------------------------------------
+
+GVL_PERSIST.aConv[3].Cfg.xSensor1Enabled	:= TRUE;
+GVL_PERSIST.aConv[4].Cfg.xSensor1Enabled	:= TRUE;
+GVL_PERSIST.aConv[7].Cfg.xSensor1Enabled	:= TRUE;
+GVL_PERSIST.aConv[11].Cfg.xSensor1Enabled	:= TRUE;
+GVL_PERSIST.aConv[13].Cfg.xSensor1Enabled	:= TRUE;
+GVL_PERSIST.aConv[16].Cfg.xSensor1Enabled	:= TRUE;
+
+
+// -------------------------------------------------------------
+// ODWROCONY KIERUNEK - ZLE PODLACZONE SILNIKI
+// -------------------------------------------------------------
+//
+// Stacje 1, 5, 6, 7, 8, 9, 14, 15, 16. Do poprawy w szafie,
+// na razie odwracamy bit.
+
+GVL_PERSIST.aConv[1].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[5].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[6].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[7].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[8].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[9].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[14].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[15].Cfg.xInvertDirection	:= TRUE;
+GVL_PERSIST.aConv[16].Cfg.xInvertDirection	:= TRUE;
+
+
+// -------------------------------------------------------------
+// CZASY PRZEJAZDU NA STACJACH BEZ CZUJNIKOW
+// -------------------------------------------------------------
+
+GVL_PERSIST.aConv[1].Cfg.tBlindTravel		:= T#4S;
+GVL_PERSIST.aConv[2].Cfg.tBlindTravel		:= T#5S;
+GVL_PERSIST.aConv[5].Cfg.tBlindTravel		:= T#5S;
+GVL_PERSIST.aConv[6].Cfg.tBlindTravel		:= T#5S;
+GVL_PERSIST.aConv[8].Cfg.tBlindTravel		:= T#5S;
+
+// Transporter lancuchowy - przejazd poprzeczny
+GVL_PERSIST.aConv[9].Cfg.tBlindTravel		:= T#6S;
+
+GVL_PERSIST.aConv[10].Cfg.tBlindTravel		:= T#5S;
+GVL_PERSIST.aConv[12].Cfg.tBlindTravel		:= T#5S;
+GVL_PERSIST.aConv[14].Cfg.tBlindTravel		:= T#5S;
+GVL_PERSIST.aConv[15].Cfg.tBlindTravel		:= T#5S;
+
+
+// -------------------------------------------------------------
+// ODBIOR PRZEZ OPERATORA - STACJE 13 I 16
+// -------------------------------------------------------------
+//
+// Bez przycisku: miejsce jest wolne po 5 s od zniknieca
+// ladunku z czujnika.
+
+GVL_PERSIST.aConv[13].Cfg.xPickupByButton	:= FALSE;
+GVL_PERSIST.aConv[13].Cfg.tPickupTimeout	:= T#5S;
+GVL_PERSIST.aConv[16].Cfg.xPickupByButton	:= FALSE;
+GVL_PERSIST.aConv[16].Cfg.tPickupTimeout	:= T#5S;
+
+
+// -------------------------------------------------------------
+// SILOWNIKI - BEZ CZUJNIKOW, RUCH NA CZASOWKI
+// -------------------------------------------------------------
+
+FOR i := 1 TO 32 DO
+	GVL_PERSIST.aCyl[i].Cfg.eFeedback			:= CYLFB_NONE;
+	GVL_PERSIST.aCyl[i].Cfg.eValve				:= CYLV_DOUBLE;
+	GVL_PERSIST.aCyl[i].Cfg.xExtendFbEnabled	:= FALSE;
+	GVL_PERSIST.aCyl[i].Cfg.xRetractFbEnabled	:= FALSE;
+	GVL_PERSIST.aCyl[i].Cfg.xExtendWdEnabled	:= FALSE;
+	GVL_PERSIST.aCyl[i].Cfg.xRetractWdEnabled	:= FALSE;
+	GVL_PERSIST.aCyl[i].Cfg.tExtendDelay		:= T#0MS;
+	GVL_PERSIST.aCyl[i].Cfg.tRetractDelay		:= T#0MS;
+	GVL_PERSIST.aCyl[i].Cfg.tExtendSubst		:= T#3S;
+	GVL_PERSIST.aCyl[i].Cfg.tRetractSubst		:= T#3S;
+END_FOR
+
+// Dociski stacji 4 - szybciej niz reszta
+FOR i := 1 TO 3 DO
+	GVL_PERSIST.aCyl[i].Cfg.tExtendSubst		:= T#1S;
+	GVL_PERSIST.aCyl[i].Cfg.tRetractSubst		:= T#1S;
+END_FOR
+
+// Blokada stacji 5 - zawor 3-polozeniowy
+GVL_PERSIST.aCyl[15].Cfg.eValve					:= CYLV_3POS_MID;
+
+// Szczeki desztaplarki i sztaplarki - 5 s na ruch
+GVL_PERSIST.aCyl[25].Cfg.tExtendSubst			:= T#5S;
+GVL_PERSIST.aCyl[25].Cfg.tRetractSubst			:= T#5S;
+GVL_PERSIST.aCyl[26].Cfg.tExtendSubst			:= T#5S;
+GVL_PERSIST.aCyl[26].Cfg.tRetractSubst			:= T#5S;
+
+
+// -------------------------------------------------------------
+// STACJA 4
+// -------------------------------------------------------------
+
+GVL_PERSIST.St04.xPreSensorInstalled	:= TRUE;
+GVL_PERSIST.St04.xPreSensorInverted		:= FALSE;
+GVL_PERSIST.St04.tPreToUpper			:= T#1S200MS;
+GVL_PERSIST.St04.tEntryToUpper			:= T#3S;
+GVL_PERSIST.St04.tUpperToLower			:= T#400MS;
+GVL_PERSIST.St04.tOpWatchdog			:= T#60S;
+GVL_PERSIST.St04.lrRollerFreq			:= cTestFreq;
+
+
+// -------------------------------------------------------------
+// STACJA 5
+// -------------------------------------------------------------
+
+GVL_PERSIST.St05.tDetectToLift		:= T#500MS;
+GVL_PERSIST.St05.tJawsToPull		:= T#500MS;
+GVL_PERSIST.St05.tOpWatchdog		:= T#120S;
+
+
+// -------------------------------------------------------------
+// DESZTAPLARKA - POZYCJE Z PALCA
+// -------------------------------------------------------------
+//
+// Wartosci do poprawienia po zmierzeniu na maszynie.
+// Musza tworzyc ciag - kod to sprawdza.
+
+GVL_PERSIST.St03.Cfg.diPosBottom		:= 1000;
+GVL_PERSIST.St03.Cfg.diPosMiddle		:= 2000;
+GVL_PERSIST.St03.Cfg.diPosTop			:= 3000;
+GVL_PERSIST.St03.Cfg.diWindow			:= 20;
+GVL_PERSIST.St03.Cfg.diSlowZone			:= 300;
+GVL_PERSIST.St03.Cfg.xIncreaseIsForward	:= TRUE;
+GVL_PERSIST.St03.Cfg.lrFreqFast			:= cTestFreq;
+GVL_PERSIST.St03.Cfg.lrFreqSlow			:= cTestFreq;
+GVL_PERSIST.St03.Cfg.lrFreqManual		:= cTestFreq;
+GVL_PERSIST.St03.Cfg.tMoveWatchdog		:= T#30S;
+GVL_PERSIST.St03.Cfg.tSettle			:= T#200MS;
+GVL_PERSIST.St03.Cfg.nStackSize			:= 15;
+
+
+// -------------------------------------------------------------
+// SZTAPLARKA - POZYCJE Z PALCA, INNE NIZ DESZTAPLARKI
+// -------------------------------------------------------------
+
+GVL_PERSIST.St11.Cfg.diPosBottom		:= 5000;
+GVL_PERSIST.St11.Cfg.diPosMiddle		:= 6000;
+GVL_PERSIST.St11.Cfg.diPosTop			:= 7000;
+GVL_PERSIST.St11.Cfg.diWindow			:= 20;
+GVL_PERSIST.St11.Cfg.diSlowZone			:= 300;
+GVL_PERSIST.St11.Cfg.xIncreaseIsForward	:= TRUE;
+GVL_PERSIST.St11.Cfg.lrFreqFast			:= cTestFreq;
+GVL_PERSIST.St11.Cfg.lrFreqSlow			:= cTestFreq;
+GVL_PERSIST.St11.Cfg.lrFreqManual		:= cTestFreq;
+GVL_PERSIST.St11.Cfg.tMoveWatchdog		:= T#30S;
+GVL_PERSIST.St11.Cfg.tSettle			:= T#200MS;
+GVL_PERSIST.St11.Cfg.nStackSize			:= 15;
+
+
+// -------------------------------------------------------------
+// PODPIECIE REKORDOW I NAPEDOW
+// -------------------------------------------------------------
+
+FOR i := 1 TO 16 DO
+	aNode[i]^.M_Config(nId := i, pPersist := ADR(GVL_PERSIST.aConv[i]));
+END_FOR
+
+// Przydzial falownikow wg listy z dokumentacji
+fbSt01.M_ConfigDrive(pDrv := ADR(fbNord[8]));
+fbSt02.M_ConfigDrive(pDrv := ADR(fbNord[9]));
+fbSt03.M_ConfigDrive(pDrv := ADR(fbNord[10]));
+fbSt04.M_ConfigDrive(pDrv := ADR(fbNord[4]));
+fbSt05.M_ConfigDrive(pDrv := ADR(fbNord[5]));
+fbSt06.M_ConfigDrive(pDrv := ADR(fbNord[6]));
+fbSt07.M_ConfigDrive(pDrv := ADR(fbNord[11]));
+fbSt08.M_ConfigDrive(pDrv := ADR(fbNord[12]));
+fbSt09.M_ConfigDrive(pDrv := ADR(fbNord[7]));
+fbSt10.M_ConfigDrive(pDrv := ADR(fbNord[16]));
+fbSt11.M_ConfigDrive(pDrv := ADR(fbNord[13]));
+fbSt12.M_ConfigDrive(pDrv := ADR(fbNord[14]));
+fbSt13.M_ConfigDrive(pDrv := ADR(fbNord[15]));
+fbSt14.M_ConfigDrive(pDrv := ADR(fbNord[17]));
+fbSt15.M_ConfigDrive(pDrv := ADR(fbNord[18]));
+fbSt16.M_ConfigDrive(pDrv := ADR(fbNord[19]));
+
+
+// Stacja 4 - rolki dociskowe na falowniku 3
+fbSt04.M_ConfigStation(
+	pStCfg		:= ADR(GVL_PERSIST.St04),
+	pRollerDrv	:= ADR(fbNord[3]),
+	pCylArray	:= ADR(GVL_PERSIST.aCyl),
+	nCylBase	:= 1
+);
+
+// Stacja 5
+fbSt05.M_ConfigStation(
+	pStCfg		:= ADR(GVL_PERSIST.St05),
+	pCylArray	:= ADR(GVL_PERSIST.aCyl),
+	nCylBase	:= 12
+);
+
+// Desztaplarka - krzywka na falowniku 1
+fbSt03.M_ConfigStation(
+	pStPersist	:= ADR(GVL_PERSIST.St03),
+	pLiftDrive	:= ADR(fbNord[1]),
+	nJawId		:= 25,
+	pJawPersist	:= ADR(GVL_PERSIST.aCyl[25])
+);
+
+// Sztaplarka - falownik krzywki DO USTALENIA.
+// Falownik 2 jest na stacji 8, wiec zostaje bez przydzialu.
+// Do czasu ustalenia sztaplarka pracuje jako zwykly przelot -
+// patrz GVL_PERSIST.aConv[11].Cfg.xStationEnabled ponizej.
+fbSt11.M_ConfigStation(
+	pStPersist	:= ADR(GVL_PERSIST.St11),
+	pLiftDrive	:= 0,
+	nJawId		:= 26,
+	pJawPersist	:= ADR(GVL_PERSIST.aCyl[26])
+);
+
+GVL_PERSIST.aConv[11].Cfg.xStationEnabled := FALSE;
+
+
+// -------------------------------------------------------------
+// LANCUCH TRANSPORTU
+// -------------------------------------------------------------
+//
+// Trasa dobrych:  1 - 2 - 3 - 4 - 5 - 6 - 7 - 8 - 11 - 12 - 13
+// Trasa odrzutu:  8 - 9 - 10 - 14 - 15 - 16
+// Nastepnik stacji 8 przelacza ACT_Verdict.
+
+fbSt01.M_Link(pPrevNode := 0,            pNextNode := ADR(fbSt02));
+fbSt02.M_Link(pPrevNode := ADR(fbSt01),  pNextNode := ADR(fbSt03));
+fbSt03.M_Link(pPrevNode := ADR(fbSt02),  pNextNode := ADR(fbSt04));
+fbSt04.M_Link(pPrevNode := ADR(fbSt03),  pNextNode := ADR(fbSt05));
+fbSt05.M_Link(pPrevNode := ADR(fbSt04),  pNextNode := ADR(fbSt06));
+fbSt06.M_Link(pPrevNode := ADR(fbSt05),  pNextNode := ADR(fbSt07));
+fbSt07.M_Link(pPrevNode := ADR(fbSt06),  pNextNode := ADR(fbSt08));
+fbSt08.M_Link(pPrevNode := ADR(fbSt07),  pNextNode := ADR(fbSt11));
+
+fbSt11.M_Link(pPrevNode := ADR(fbSt08),  pNextNode := ADR(fbSt12));
+fbSt12.M_Link(pPrevNode := ADR(fbSt11),  pNextNode := ADR(fbSt13));
+fbSt13.M_Link(pPrevNode := ADR(fbSt12),  pNextNode := 0);
+
+fbSt09.M_Link(pPrevNode := ADR(fbSt08),  pNextNode := ADR(fbSt10));
+fbSt10.M_Link(pPrevNode := ADR(fbSt09),  pNextNode := ADR(fbSt14));
+fbSt14.M_Link(pPrevNode := ADR(fbSt10),  pNextNode := ADR(fbSt15));
+fbSt15.M_Link(pPrevNode := ADR(fbSt14),  pNextNode := ADR(fbSt16));
+fbSt16.M_Link(pPrevNode := ADR(fbSt15),  pNextNode := 0);
+]]></ST>
+      </Implementation>
+    </Action>
+
+    <Action Name="ACT_Commands" Id="{4a10d002-0000-4000-9000-00000000d002}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Commands
+// Komendy operatora
+// =============================================================
+
+
+// -------------------------------------------------------------
+// WSTAWIENIE STOSU NA STACJE 1
+// -------------------------------------------------------------
+//
+// Czujnik stacji 1 nie widzi stosu, wiec obecnosc podajemy
+// bitem. Stos wjezdza do maszyny jak zwykly ladunek.
+
+rtrgStack(CLK := xCmdStackInserted);
+
+IF rtrgStack.Q THEN
+
+	IF NOT GVL_PERSIST.aConv[1].Mem.xLoadPresent THEN
+		nLoadSeq := nLoadSeq + 1;
+		fbSt01.M_InjectLoad(xNok := FALSE, nLoadId := nLoadSeq, xOpDone := TRUE);
+	END_IF
+
+END_IF
+
+
+// -------------------------------------------------------------
+// KASOWANIE ALARMOW
+// -------------------------------------------------------------
+
+rtrgReset(CLK := xCmdReset);
+
+IF rtrgReset.Q THEN
+	FOR i := 1 TO 16 DO
+		aNode[i]^.M_Reset();
+	END_FOR
+END_IF
+
+
+// -------------------------------------------------------------
+// RESET MASZYNY DO STANU ZEROWEGO
+// -------------------------------------------------------------
+//
+// Kasuje pamiec obecnosci na wszystkich stacjach oraz liczniki
+// desztaplarki i sztaplarki. Uzywac po recznym oproznieniu
+// maszyny - maszyna uwierzy, ze jest pusta.
+
+rtrgClear(CLK := xCmdClearMachine);
+
+IF rtrgClear.Q THEN
+
+	FOR i := 1 TO 16 DO
+		aNode[i]^.M_ServiceSetEmpty();
+	END_FOR
+
+	fbSt03.M_ServiceClearStack();
+	fbSt11.M_ServiceClearStack();
+
+	nPalletsDone	:= 0;
+	nOkCount		:= 0;
+	nNokCount		:= 0;
+
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+
+    <Action Name="ACT_Stations" Id="{4a10d003-0000-4000-9000-00000000d003}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Stations
+// Wywolanie wszystkich stacji
+// =============================================================
+//
+// Czujniki podajemy w logice WPROST - przelicza je nastawa
+// xSensorsInverted w rekordzie stacji.
+
+
+// Stacja 1 - czujnik nie widzi stosu, wiec pracuje na czasowce
+fbSt01(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= xSens_St01,
+	xSens2Raw		:= FALSE
+);
+
+fbSt02(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt03(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= xSens_St03,
+	xSens2Raw		:= FALSE,
+	diLiftPosRaw	:= diEnc_St03,
+	xJawClosedSw	:= FALSE,
+	xJawOpenSw		:= FALSE
+);
+
+// Czujnik wstepny wpisujemy PRZED wywolaniem - inaczej stacja
+// zobaczylaby go dopiero w nastepnym cyklu
+fbSt04.stIn.xPreSensRaw := xSens_St04_Entry;
+
+fbSt04(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= xSens_St04_Stop,
+	xSens2Raw		:= FALSE
+);
+
+fbSt05(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt06(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt07(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= xSens_St07,
+	xSens2Raw		:= FALSE
+);
+
+fbSt08(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+// Transporter lancuchowy - bez wlasnych czujnikow
+fbSt09(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt10(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt11(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= xSens_St11,
+	xSens2Raw		:= FALSE,
+	diLiftPosRaw	:= diEnc_St11,
+	xJawClosedSw	:= FALSE,
+	xJawOpenSw		:= FALSE
+);
+
+fbSt12(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt13(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= xSens_St13,
+	xSens2Raw		:= FALSE,
+	xPickupButton	:= FALSE
+);
+
+fbSt14(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt15(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= FALSE,
+	xSens2Raw		:= FALSE
+);
+
+fbSt16(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	xTransferEnable	:= xTransferEnable,
+	xSens1Raw		:= xSens_St16,
+	xSens2Raw		:= FALSE,
+	xPickupButton	:= FALSE
+);
+
+
+// -------------------------------------------------------------
+// CEWKI SZCZEK
+// -------------------------------------------------------------
+
+xOut_St03_JawClose	:= fbSt03.xJawCoilClose;
+xOut_St03_JawOpen	:= fbSt03.xJawCoilOpen;
+xOut_St11_JawClose	:= fbSt11.xJawCoilClose;
+xOut_St11_JawOpen	:= fbSt11.xJawCoilOpen;
+
+
+// -------------------------------------------------------------
+// ZAWORY STACJI 4 I 5
+// -------------------------------------------------------------
+
+GVL.OUTPUTS[4]	:= fbSt04.stOut.xLowerExtend;
+GVL.OUTPUTS[3]	:= fbSt04.stOut.xLowerRetract;
+GVL.OUTPUTS[7]	:= fbSt04.stOut.xUpperWideExtend;
+GVL.OUTPUTS[2]	:= fbSt04.stOut.xUpperWideRetract;
+GVL.OUTPUTS[5]	:= fbSt04.stOut.xUpperNarrowExtend;
+GVL.OUTPUTS[6]	:= fbSt04.stOut.xUpperNarrowRetract;
+
+GVL.FestoValves_1[6,1]	:= fbSt05.stOut.xBlockExtend;
+GVL.FestoValves_1[6,2]	:= fbSt05.stOut.xBlockRetract;
+GVL.FestoValves_1[7,1]	:= fbSt05.stOut.xJawLiftExtend;
+GVL.FestoValves_1[7,2]	:= fbSt05.stOut.xJawLiftRetract;
+
+FOR i := 1 TO 3 DO
+	GVL.FestoValves_1[i,1] := fbSt05.stOut.axJawClose[i];
+END_FOR
+
+// Numer zaworu nie jest numerem silownika - patrz ST_St05_Out
+GVL.FestoValves_2[4,2] := fbSt05.stOut.axPullUp[1];
+GVL.FestoValves_2[4,1] := fbSt05.stOut.axPullDown[1];
+GVL.FestoValves_2[3,2] := fbSt05.stOut.axPullUp[2];
+GVL.FestoValves_2[3,1] := fbSt05.stOut.axPullDown[2];
+GVL.FestoValves_2[1,2] := fbSt05.stOut.axPullUp[3];
+GVL.FestoValves_2[1,1] := fbSt05.stOut.axPullDown[3];
+GVL.FestoValves_2[2,2] := fbSt05.stOut.axPullUp[4];
+GVL.FestoValves_2[2,1] := fbSt05.stOut.axPullDown[4];
+GVL.FestoValves_2[5,2] := fbSt05.stOut.axPullUp[5];
+GVL.FestoValves_2[5,1] := fbSt05.stOut.axPullDown[5];
+GVL.FestoValves_2[6,2] := fbSt05.stOut.axPullUp[6];
+GVL.FestoValves_2[6,1] := fbSt05.stOut.axPullDown[6];
+]]></ST>
+      </Implementation>
+    </Action>
+
+    <Action Name="ACT_Verdict" Id="{4a10d004-0000-4000-9000-00000000d004}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Verdict
+// Werdykt OK / NOK oraz trasowanie na stacji 8
+// =============================================================
+//
+// WERSJA TESTOWA. Docelowo werdykt wystawiaja stacje 4, 5 i 6.
+// Tutaj co piata paleta idzie na odrzut, zeby przecwiczyc obie
+// trasy bez czekania na prawdziwe testy.
+
+rtrgSt05(CLK := GVL_PERSIST.aConv[5].Mem.xOperationDone);
+
+IF rtrgSt05.Q THEN
+
+	nPalletsDone := nPalletsDone + 1;
+
+	IF (nPalletsDone MOD cNokEvery) = 0 THEN
+		GVL_PERSIST.aConv[5].Mem.xLoadNok := TRUE;
+		nNokCount := nNokCount + 1;
+	ELSE
+		nOkCount := nOkCount + 1;
+	END_IF
+
+END_IF
+
+
+// -------------------------------------------------------------
+// ROZJAZD NA STACJI 8
+// -------------------------------------------------------------
+//
+// Paleta dobra jedzie prosto na sztaplarke, odrzucona
+// na transporter poprzeczny.
+
+IF GVL_PERSIST.aConv[8].Mem.xLoadNok THEN
+	fbSt08.M_SetNext(pNextNode := ADR(fbSt09));
+ELSE
+	fbSt08.M_SetNext(pNextNode := ADR(fbSt11));
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+
+    <Action Name="ACT_Drives" Id="{4a10d005-0000-4000-9000-00000000d005}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Drives
+// Wywolanie falownikow - PO stacjach
+// =============================================================
+
+FOR i := 1 TO cNumDrives DO
+
+	fbNord[i](
+		lrFmax			:= cFmax,
+		xSafetyOK		:= xSafetyOK,
+		// TODO: podpiac realny status EtherCAT (WcState)
+		xEtherCAT_OK	:= TRUE,
+		stIn			:= GVL.NORD_DRIVE_IN[i]
+	);
+
+	GVL.NORD_DRIVE_OUT[i] := fbNord[i].stOut;
+
+	aeDrvState[i]		:= fbNord[i].eState;
+	axDrvRunning[i]		:= fbNord[i].xRunning;
+	axDrvError[i]		:= fbNord[i].xError;
+	alrDrvFreqAct[i]	:= fbNord[i].lrFreqActual;
+
+END_FOR
+]]></ST>
+      </Implementation>
+    </Action>
+
+    <Action Name="ACT_Diag" Id="{4a10d006-0000-4000-9000-00000000d006}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Diag
+// Lustro stanu wszystkich stacji do podgladu online
+// =============================================================
+
+FOR i := 1 TO 16 DO
+	aeState[i]		:= aNode[i]^.eState;
+	aeWait[i]		:= aNode[i]^.eWait;
+	aeAlarm[i]		:= aNode[i]^.eAlarm;
+	axOccupied[i]	:= aNode[i]^.xOccupied;
+	axNok[i]		:= aNode[i]^.xLoadNok;
+END_FOR
+]]></ST>
+      </Implementation>
+    </Action>
+
+  </POU>
+</TcPlcObject>

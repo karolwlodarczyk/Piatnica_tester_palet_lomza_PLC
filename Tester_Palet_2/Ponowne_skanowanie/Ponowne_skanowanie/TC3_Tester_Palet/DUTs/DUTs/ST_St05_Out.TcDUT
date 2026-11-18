@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_St05_Out" Id="{7a1c0022-0000-4000-9000-000000000022}">
+    <Declaration><![CDATA[TYPE ST_St05_Out :
+STRUCT
+	// =========================================================
+	// STACJA 5 - CEWKI ZAWOROW
+	// =========================================================
+	//
+	// Mapowanie w MAIN:
+	//   xBlockExtend    -> FestoValves_1[6,1]   blokada w gore
+	//   xBlockRetract   -> FestoValves_1[6,2]   blokada w dol
+	//   xJawLiftExtend  -> FestoValves_1[7,1]   szczeki w gore
+	//   xJawLiftRetract -> FestoValves_1[7,2]   szczeki w dol
+	//   axJawClose[1]   -> FestoValves_1[1,1]   szczeki lewe
+	//   axJawClose[2]   -> FestoValves_1[2,1]   szczeki srodkowe
+	//   axJawClose[3]   -> FestoValves_1[3,1]   szczeki prawe
+	//
+	// Silowniki rozrywajace - UWAGA, numer zaworu nie jest
+	// numerem silownika:
+	//   silownik 1 -> FestoValves_2[4,2] gora / [4,1] dol
+	//   silownik 2 -> FestoValves_2[3,2] gora / [3,1] dol
+	//   silownik 3 -> FestoValves_2[1,2] gora / [1,1] dol
+	//   silownik 4 -> FestoValves_2[2,2] gora / [2,1] dol
+	//   silownik 5 -> FestoValves_2[5,2] gora / [5,1] dol
+	//   silownik 6 -> FestoValves_2[6,2] gora / [6,1] dol
+	//
+	// Tablice ponizej sa indeksowane NUMEREM SILOWNIKA.
+
+	xBlockExtend	: BOOL;
+	xBlockRetract	: BOOL;
+
+	xJawLiftExtend	: BOOL;
+	xJawLiftRetract	: BOOL;
+
+	// TRUE = szczeki zamkniete (zawor monostabilny)
+	axJawClose		: ARRAY[1..3] OF BOOL;
+
+	axPullUp		: ARRAY[1..6] OF BOOL;
+	axPullDown		: ARRAY[1..6] OF BOOL;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

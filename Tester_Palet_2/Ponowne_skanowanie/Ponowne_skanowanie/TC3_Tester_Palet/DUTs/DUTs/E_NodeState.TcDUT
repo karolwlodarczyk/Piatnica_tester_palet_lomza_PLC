@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_NodeState" Id="{7a1c0002-0000-4000-9000-000000000002}">
+    <Declaration><![CDATA[TYPE E_NodeState :
+(
+	// Stan poczatkowy - weryfikacja pamieci wzgledem czujnikow
+	NODE_INIT		:= 0,
+
+	// Wezel pusty, gotowy przyjac ladunek
+	NODE_EMPTY		:= 10,
+
+	// Ladunek wjezdza na wezel
+	NODE_INFEED		:= 20,
+
+	// Wykryto pozycje koncowa, trwa czasowka do zatrzymania
+	NODE_STOP_DELAY	:= 30,
+
+	// Ladunek stoi, brak operacji technologicznej
+	NODE_OCCUPIED	:= 40,
+
+	// Trwa operacja technologiczna stacji
+	NODE_BUSY		:= 50,
+
+	// Wydawanie ladunku na nastepny wezel
+	NODE_OUTFEED	:= 60,
+
+	// Praca reczna
+	NODE_MANUAL		:= 70,
+
+	// Pamiec nie zgadza sie z czujnikami - wymagana decyzja operatora
+	NODE_VERIFY		:= 80,
+
+	// Alarm - ruch zablokowany do czasu resetu
+	NODE_ALARM		:= 90
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

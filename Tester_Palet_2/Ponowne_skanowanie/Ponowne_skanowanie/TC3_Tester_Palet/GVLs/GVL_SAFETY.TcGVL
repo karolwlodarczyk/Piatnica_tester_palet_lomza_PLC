@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <GVL Name="GVL_SAFETY" Id="{a8ae582e-ee31-4043-9686-cd1c2e6fcbbd}">
+    <Declaration><![CDATA[VAR_GLOBAL
+	Q_SafetyEnable AT %Q* : BOOL := TRUE;
+	Q_SafetyReset AT %Q* : BOOL; 
+	
+	xSTO AT %I* : BOOL;
+	xAir AT %I* : BOOL;
+	xResetCmd AT %I* : BOOL;
+	
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>

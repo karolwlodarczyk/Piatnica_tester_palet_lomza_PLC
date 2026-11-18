@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_StackMem" Id="{7a1c0042-0000-4000-9000-000000000042}">
+    <Declaration><![CDATA[TYPE ST_StackMem :
+STRUCT
+	// =========================================================
+	// PAMIEC DESZTAPLARKI / SZTAPLARKI - ZMIENNE NIEULOTNE
+	// =========================================================
+	//
+	// Po zaniku zasilania maszyna musi wiedziec, ile palet
+	// zostalo w stosie i ile wisi na szczekach. Bez tego
+	// operator musialby rozladowac stacje recznie.
+
+	// Stos dojechal na stacje i zostal potwierdzony czujnikami
+	xStackArrived	: BOOL;
+
+	// DESZTAPLARKA: ile palet zostalo do wydania, wliczajac te,
+	// ktora aktualnie lezy na transporterze
+	nRemaining		: INT;
+
+	// SZTAPLARKA: ile palet wisi na szczekach
+	nHeld			: INT;
+
+	// Szczeki trzymaja ladunek - po zaniku zasilania nie wolno
+	// ich otworzyc bez sprowadzenia wozka na pozycje odkladania
+	xJawsLoaded		: BOOL;
+
+	// Ostatnia znana pozycja enkodera, zapisywana na biezaco.
+	// Po starcie porownujemy ja z odczytem: jesli sie zgadza,
+	// enkoder utrzymal wartosc przez zanik zasilania i NIE ma
+	// potrzeby bazowania. Jesli nie - kod sam to zglosi.
+	diLastPos		: DINT;
+
+	// TRUE = po starcie odczyt enkodera nie zgodzil sie
+	// z zapamietanym. Trzeba zbazowac pozycje dolna.
+	xNeedHoming		: BOOL;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

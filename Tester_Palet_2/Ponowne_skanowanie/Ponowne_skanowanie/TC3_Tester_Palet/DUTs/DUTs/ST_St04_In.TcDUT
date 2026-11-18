@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_St04_In" Id="{7a1c0031-0000-4000-9000-000000000031}">
+    <Declaration><![CDATA[TYPE ST_St04_In :
+STRUCT
+	// =========================================================
+	// STACJA 4 - SYGNALY WEJSCIOWE
+	// =========================================================
+
+	// Czujnik wstepny - jeszcze niepodlinkowany.
+	// Do czasu montazu zostawic Cfg.xPreSensorInstalled = FALSE.
+	xPreSensRaw		: BOOL := TRUE;
+
+	// Przetworniki polozenia IO-Link, po jednym na KAZDY
+	// silownik, mimo ze zawory steruja grupami:
+	//   1..3  dolne
+	//   4..6  gorne od szerokich desek
+	//   7..8  gorne od waskich desek
+	adiCylPos		: ARRAY[1..8] OF DINT;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

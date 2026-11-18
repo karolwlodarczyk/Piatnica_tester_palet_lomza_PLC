@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_NodeAlarm" Id="{7a1c0004-0000-4000-9000-000000000004}">
+    <Declaration><![CDATA[TYPE E_NodeAlarm :
+(
+	ALM_NONE					:= 0,
+
+	// Ladunek nie dojechal w czasie tInfeedWatchdog
+	ALM_INFEED_TIMEOUT			:= 1,
+
+	// Ladunek nie zjechal w czasie tOutfeedWatchdog
+	ALM_OUTFEED_TIMEOUT			:= 2,
+
+	// Pamiec mowi "pusto", czujniki widza ladunek
+	ALM_UNEXPECTED_LOAD			:= 3,
+
+	// Pamiec mowi "zajete", czujniki nie widza nic
+	ALM_LOAD_LOST				:= 4,
+
+	// Czujniki nie zgadzaja sie ze soba po zatrzymaniu
+	ALM_SENSOR_DISAGREE			:= 5,
+
+	// Blad falownika
+	ALM_DRIVE_FAULT				:= 6,
+
+	// Falownik nie potwierdzil ruchu mimo zadania
+	ALM_DRIVE_NO_FEEDBACK		:= 7,
+
+	// Wyczerpano liczbe prob wznowienia przerwanego przejazdu
+	ALM_RESUME_FAILED			:= 8,
+
+	// Brak wywolania M_Config - wezel nie ma parametrow
+	ALM_NOT_CONFIGURED			:= 9,
+
+	// Operacja technologiczna stacji zglosila blad
+	ALM_OPERATION_FAILED		:= 10
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

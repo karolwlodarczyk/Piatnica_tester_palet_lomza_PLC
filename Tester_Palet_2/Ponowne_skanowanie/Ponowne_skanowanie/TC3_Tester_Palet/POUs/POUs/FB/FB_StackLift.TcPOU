@@ -1,0 +1,518 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_StackLift" Id="{7b2d0700-0000-4000-9000-000000000700}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_StackLift
+// =============================================================
+// WOZEK ZE SZCZEKAMI - DESZTAPLARKA I SZTAPLARKA
+// =============================================================
+//
+// Jedna kinematyka dla obu maszyn: wozek jezdzacy w pionie na
+// falowniku NORD, enkoder absolutny i szczeki na siłowniku.
+// Rozni je wylacznie kolejnosc krokow, ktora siedzi w stacjach.
+//
+// -------------------------------------------------------------
+// TRZY POZYCJE
+// -------------------------------------------------------------
+//   POS_BOTTOM  deski pierwszej palety od dolu
+//   POS_MIDDLE  deski drugiej palety od dolu
+//   POS_TOP     stos uniesiony
+//
+// Odleglosc miedzy nimi to wysokosc palety - stad wszystkie trzy
+// sa potrzebne i stad kontrola, ze tworza ciag. Wpisanie ich
+// w zlej kolejnosci wyslaloby wozek w przeciwna strone niz
+// trzeba, wiec sprawdzamy to, zanim ruszymy.
+//
+// -------------------------------------------------------------
+// POZYCJONOWANIE
+// -------------------------------------------------------------
+// Falownik NORD dostaje wylacznie czestotliwosc, wiec dojazd
+// jest dwustopniowy: pelna predkosc do strefy dojazdowej, potem
+// predkosc dojazdowa do okna pozycji. Hamowanie realizuje rampa
+// falownika (P103), tak jak wszedzie indziej w tym projekcie.
+VAR_INPUT
+
+	eMode			: E_MachineMode;
+	xSafetyOK		: BOOL;
+
+	// Enkoder absolutny wozka
+	diPosRaw		: DINT;
+
+	// Krancowki szczek - jesli ich nie ma, wylaczyc obserwacje
+	// w rekordzie silownika i pracowac na czasowce
+	xJawClosedSw	: BOOL;
+	xJawOpenSw		: BOOL;
+
+END_VAR
+VAR_OUTPUT
+
+	// Cewki szczek - stacja przepisuje na swoje wyjscia
+	xJawCoilClose	: BOOL;
+	xJawCoilOpen	: BOOL;
+
+	diPos			: DINT;
+	diTarget		: DINT;
+	diError			: DINT;
+
+	// 0 brak, 1 dol, 2 srodek, 3 gora
+	nTargetSel		: INT;
+
+	xInPosition		: BOOL;
+	xMoving			: BOOL;
+	xJawsClosed		: BOOL;
+	xJawsOpen		: BOOL;
+
+	eAlarm			: E_StackAlarm;
+	xAlarm			: BOOL;
+
+END_VAR
+VAR
+
+	pP				: POINTER TO ST_StackPersist;
+	pDrive			: POINTER TO FB_NordSK550PP;
+
+	fbJaw			: FB_Cylinder;
+
+	xRunReq			: BOOL;
+	xRevReq			: BOOL;
+	lrFreqReq		: LREAL;
+
+	xRunOld			: BOOL;
+	xRevOld			: BOOL;
+	lrFreqOld		: LREAL;
+
+	tonMoveWd		: TON;
+	tonSettle		: TON;
+
+	xManUp			: BOOL;
+	xManDown		: BOOL;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL WOZKA
+// =============================================================
+
+
+// -------------------------------------------------------------
+// 1. KONFIGURACJA
+// -------------------------------------------------------------
+
+IF pP = 0 THEN
+	M_HaltDrive();
+	eAlarm := ALM_STK_NOT_CONFIGURED;
+	xAlarm := TRUE;
+	RETURN;
+END_IF
+
+diPos	:= diPosRaw;
+diError	:= diTarget - diPos;
+xAlarm	:= (eAlarm <> ALM_STK_NONE);
+
+
+// -------------------------------------------------------------
+// 2. SZCZEKI
+// -------------------------------------------------------------
+
+fbJaw(
+	eMode		:= eMode,
+	xSafetyOK	:= xSafetyOK,
+	xSwExtRaw	:= xJawClosedSw,
+	xSwRetRaw	:= xJawOpenSw
+);
+
+xJawCoilClose	:= fbJaw.xCoilExtend;
+xJawCoilOpen	:= fbJaw.xCoilRetract;
+xJawsClosed		:= fbJaw.xExtended;
+xJawsOpen		:= fbJaw.xRetracted;
+
+IF fbJaw.xAlarm THEN
+	M_RaiseAlarm(eNew := ALM_STK_JAW_TIMEOUT);
+END_IF
+
+
+// -------------------------------------------------------------
+// 3. POPRAWNOSC POZYCJI
+// -------------------------------------------------------------
+//
+// Pozycje wpisuje czlowiek, wiec sprawdzamy je zanim wozek
+// ruszy. Musza tworzyc ciag - rosnacy albo malejacy.
+
+IF NOT M_PositionsValid() THEN
+	M_HaltDrive();
+	M_RaiseAlarm(eNew := ALM_STK_POS_INVALID);
+END_IF
+
+
+// -------------------------------------------------------------
+// 4. BLAD FALOWNIKA
+// -------------------------------------------------------------
+
+IF pDrive <> 0 THEN
+	IF pDrive^.xFault OR pDrive^.xCommError THEN
+		M_RaiseAlarm(eNew := ALM_STK_DRIVE_FAULT);
+	END_IF
+END_IF
+
+
+// -------------------------------------------------------------
+// 5. ZEZWOLENIE I TRYBY
+// -------------------------------------------------------------
+
+IF NOT xSafetyOK THEN
+	M_HaltDrive();
+	tonMoveWd(IN := FALSE);
+	M_ApplyDrive();
+	RETURN;
+END_IF
+
+IF xAlarm THEN
+	M_HaltDrive();
+	tonMoveWd(IN := FALSE);
+	M_ApplyDrive();
+	RETURN;
+END_IF
+
+IF eMode = MODE_MANUAL THEN
+	M_ManualCycle();
+	M_ApplyDrive();
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 6. DOJAZD DO POZYCJI
+// -------------------------------------------------------------
+
+IF nTargetSel = 0 THEN
+	M_HaltDrive();
+	tonMoveWd(IN := FALSE);
+	M_ApplyDrive();
+	RETURN;
+END_IF
+
+
+IF ABS(diError) <= pP^.Cfg.diWindow THEN
+
+	M_HaltDrive();
+	tonMoveWd(IN := FALSE);
+
+	// Krotkie uspokojenie, zanim stacja ruszy szczekami
+	tonSettle(IN := TRUE, PT := pP^.Cfg.tSettle);
+	xInPosition := tonSettle.Q;
+
+	M_ApplyDrive();
+	RETURN;
+
+END_IF
+
+
+xInPosition := FALSE;
+tonSettle(IN := FALSE);
+
+
+// Predkosc: pelna do strefy dojazdowej, potem dojazdowa
+IF ABS(diError) > pP^.Cfg.diSlowZone THEN
+	lrFreqReq := pP^.Cfg.lrFreqFast;
+ELSE
+	lrFreqReq := pP^.Cfg.lrFreqSlow;
+END_IF
+
+
+// Kierunek: znak bledu plus informacja, w ktora strone rosnie
+// wskazanie enkodera
+xRunReq := TRUE;
+
+IF diError > 0 THEN
+	xRevReq := NOT pP^.Cfg.xIncreaseIsForward;
+ELSE
+	xRevReq := pP^.Cfg.xIncreaseIsForward;
+END_IF
+
+
+// Watchdog dojazdu
+tonMoveWd(IN := TRUE, PT := pP^.Cfg.tMoveWatchdog);
+
+IF tonMoveWd.Q THEN
+	M_HaltDrive();
+	M_RaiseAlarm(eNew := ALM_STK_MOVE_TIMEOUT);
+END_IF
+
+
+M_ApplyDrive();
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_Config" Id="{7b2d0701-0000-4000-9000-000000000701}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Config
+// Wolac raz, przy starcie.
+VAR_INPUT
+	pPersist	: POINTER TO ST_StackPersist;
+	pDrv		: POINTER TO FB_NordSK550PP;
+	nJawId		: INT;
+	pJawPersist	: POINTER TO ST_CylPersist;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pP		:= pPersist;
+pDrive	:= pDrv;
+
+fbJaw.M_Config(nId := nJawId, pPersist := pJawPersist);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MoveTo" Id="{7b2d0702-0000-4000-9000-000000000702}">
+      <Declaration><![CDATA[METHOD PUBLIC M_MoveTo : BOOL
+// Zadanie pozycji. Zwraca TRUE, gdy wozek juz w niej stoi.
+//   1 dol, 2 srodek, 3 gora
+VAR_INPUT
+	nSel	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_MoveTo := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF nSel <> nTargetSel THEN
+	nTargetSel := nSel;
+	tonMoveWd(IN := FALSE);
+	tonSettle(IN := FALSE);
+	xInPosition := FALSE;
+END_IF
+
+CASE nSel OF
+	1: diTarget := pP^.Cfg.diPosBottom;
+	2: diTarget := pP^.Cfg.diPosMiddle;
+	3: diTarget := pP^.Cfg.diPosTop;
+ELSE
+	nTargetSel := 0;
+	RETURN;
+END_CASE
+
+M_MoveTo := xInPosition;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Park" Id="{7b2d0703-0000-4000-9000-000000000703}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Park
+// Zdjecie zadania pozycji - wozek stoi tam, gdzie jest.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nTargetSel	:= 0;
+xInPosition	:= FALSE;
+tonMoveWd(IN := FALSE);
+tonSettle(IN := FALSE);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_JawsClose" Id="{7b2d0704-0000-4000-9000-000000000704}">
+      <Declaration><![CDATA[METHOD PUBLIC M_JawsClose : BOOL
+// Zamkniecie szczek - wsuniecie ich w deski palety.
+// Zwraca TRUE po potwierdzeniu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbJaw.M_Extend();
+M_JawsClose := fbJaw.xExtended;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_JawsOpen" Id="{7b2d0705-0000-4000-9000-000000000705}">
+      <Declaration><![CDATA[METHOD PUBLIC M_JawsOpen : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbJaw.M_Retract();
+M_JawsOpen := fbJaw.xRetracted;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManJog" Id="{7b2d0706-0000-4000-9000-000000000706}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ManJog
+// Jazda reczna wozkiem oraz reczne szczeki.
+VAR_INPUT
+	xUp			: BOOL;
+	xDown		: BOOL;
+	xJawClose	: BOOL;
+	xJawOpen	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xManUp		:= xUp;
+xManDown	:= xDown;
+
+fbJaw.M_ManJog(xExt := xJawClose, xRet := xJawOpen);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d0707-0000-4000-9000-000000000707}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbJaw.M_Reset();
+
+IF pDrive <> 0 THEN
+	pDrive^.M_Reset();
+END_IF
+
+eAlarm	:= ALM_STK_NONE;
+xAlarm	:= FALSE;
+
+tonMoveWd(IN := FALSE);
+tonSettle(IN := FALSE);
+
+nTargetSel	:= 0;
+xInPosition	:= FALSE;
+M_Reset		:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_PositionsValid" Id="{7b2d0708-0000-4000-9000-000000000708}">
+      <Declaration><![CDATA[METHOD PROTECTED M_PositionsValid : BOOL
+// Dol, srodek i gora musza lezec po kolei. Odleglosc miedzy
+// nimi to wysokosc palety, wiec pomylka w kolejnosci wyslalaby
+// wozek w przeciwna strone niz trzeba.
+VAR
+	a	: DINT;
+	b	: DINT;
+	c	: DINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_PositionsValid := FALSE;
+
+a := pP^.Cfg.diPosBottom;
+b := pP^.Cfg.diPosMiddle;
+c := pP^.Cfg.diPosTop;
+
+IF (a < b) AND (b < c) THEN
+	M_PositionsValid := TRUE;
+	RETURN;
+END_IF
+
+IF (a > b) AND (b > c) THEN
+	M_PositionsValid := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManualCycle" Id="{7b2d0709-0000-4000-9000-000000000709}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ManualCycle
+// Jazda reczna bez pozycjonowania. Progi pozycji sa nadal
+// pokazywane, ale nic nie zatrzymuje wozka za operatora.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nTargetSel	:= 0;
+xInPosition	:= FALSE;
+tonMoveWd(IN := FALSE);
+
+IF xManUp AND NOT xManDown THEN
+	xRunReq		:= TRUE;
+	xRevReq		:= NOT pP^.Cfg.xIncreaseIsForward;
+	lrFreqReq	:= pP^.Cfg.lrFreqManual;
+	RETURN;
+END_IF
+
+IF xManDown AND NOT xManUp THEN
+	xRunReq		:= TRUE;
+	xRevReq		:= pP^.Cfg.xIncreaseIsForward;
+	lrFreqReq	:= pP^.Cfg.lrFreqManual;
+	RETURN;
+END_IF
+
+M_HaltDrive();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_HaltDrive" Id="{7b2d070a-0000-4000-9000-00000000070a}">
+      <Declaration><![CDATA[METHOD PROTECTED M_HaltDrive
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xRunReq		:= FALSE;
+lrFreqReq	:= 0.0;
+xMoving		:= FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ApplyDrive" Id="{7b2d070b-0000-4000-9000-00000000070b}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ApplyDrive
+// Metody falownika wolamy na zboczu - blok napedu przy
+// blokadzie sam kasuje zadanie ruchu i nie wolno mu go
+// wracac samoczynnie.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xMoving := xRunReq;
+
+IF pDrive = 0 THEN
+	RETURN;
+END_IF
+
+
+IF xRunReq AND NOT xRunOld THEN
+	pDrive^.M_Start(lrFreq := lrFreqReq, xReverse := xRevReq);
+	xRevOld		:= xRevReq;
+	lrFreqOld	:= lrFreqReq;
+	xRunOld		:= xRunReq;
+	RETURN;
+END_IF
+
+IF NOT xRunReq AND xRunOld THEN
+	pDrive^.M_Stop();
+	xRunOld := xRunReq;
+	RETURN;
+END_IF
+
+IF NOT xRunReq THEN
+	xRunOld := xRunReq;
+	RETURN;
+END_IF
+
+
+IF xRevReq <> xRevOld THEN
+	pDrive^.M_Start(lrFreq := lrFreqReq, xReverse := xRevReq);
+	xRevOld		:= xRevReq;
+	lrFreqOld	:= lrFreqReq;
+	RETURN;
+END_IF
+
+IF lrFreqReq <> lrFreqOld THEN
+	pDrive^.M_SetFrequency(lrFreq := lrFreqReq);
+	lrFreqOld := lrFreqReq;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_RaiseAlarm" Id="{7b2d070c-0000-4000-9000-00000000070c}">
+      <Declaration><![CDATA[METHOD PROTECTED M_RaiseAlarm
+VAR_INPUT
+	eNew	: E_StackAlarm;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF eNew = ALM_STK_NONE THEN
+	RETURN;
+END_IF
+
+IF eAlarm = ALM_STK_NONE THEN
+	eAlarm := eNew;
+END_IF
+
+xAlarm := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

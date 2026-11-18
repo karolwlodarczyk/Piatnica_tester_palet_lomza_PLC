@@ -1,0 +1,77 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <GVL Name="GVL_PERSIST" Id="{7c3e0001-0000-4000-9000-000000000001}">
+    <Declaration><![CDATA[VAR_GLOBAL PERSISTENT
+	// =========================================================
+	// ZMIENNE NIEULOTNE WARSTWY TRANSPORTU
+	// =========================================================
+	//
+	// Indeks = numer stacji wg ZALOZENIA.md:
+	//   1  zaladunek stosow            9  transporter lancuchowy
+	//   2  bufor stosow               10  stacja przekierowujaca
+	//   3  desztaplarka               11  sztaplarka
+	//   4  test sciskania             12  bufor stosow (wyjscie)
+	//   5  test rozrywania            13  wyjscie stosow OK
+	//   6  pomiar laserowy            14  bufor odrzutu
+	//   7  etykietowanie              15  bufor odrzutu
+	//   8  stacja rozjazdowa          16  odbior palet NOK
+	//
+	// Cfg - nastawy operatora, kod ich nie zmienia.
+	// Mem - obraz stanu maszyny, kod je zmienia i ustawia
+	//       xPersistDirty, zeby menedzer zapisal je na dysk.
+	//
+	// UWAGA: wartosci poczatkowe z ST_ConvCfg sa brane pod
+	// uwage TYLKO przy pierwszym pobraniu projektu. Pozniejsza
+	// zmiana wartosci domyslnej w kodzie nie zmieni nastaw
+	// na sterowniku - trzeba je poprawic z HMI albo wykonac
+	// "Reset origin".
+
+	aConv	: ARRAY[1..16] OF ST_ConvPersist;
+
+
+	// =========================================================
+	// SILOWNIKI I MONITORY POLOZENIA
+	// =========================================================
+	//
+	// Wspolna tablica dla zaworow i dla osobnych pomiarow -
+	// obie korzystaja z tego samego rekordu nastaw.
+	//
+	// Przydzial indeksow (do uzupelnienia przy pisaniu stacji):
+	//    1.. 3  stacja 4  grupy zaworow: dolne, gorne srodkowe,
+	//                     gorne zewnetrzne + srodkowa
+	//    4..11  stacja 4  monitory polozenia 8 silownikow
+	//   12..14  stacja 5  szczeki lewe / srodkowe / prawe
+	//   15      stacja 5  blokada punktu zatrzymania
+	//   16      stacja 5  podnoszenie szczek
+	//   17..22  stacja 5  silowniki rozrywajace 1..6
+	//   23      stacja 8  podnoszenie rolek
+	//   24      stacja 10 podnoszenie rolek
+	//   25..32  zapas
+
+	aCyl	: ARRAY[1..32] OF ST_CylPersist;
+
+
+	// =========================================================
+	// NASTAWY SEKWENCJI STACJI
+	// =========================================================
+
+	St04	: ST_St04Cfg;
+	St05	: ST_St05Cfg;
+
+
+	// =========================================================
+	// DESZTAPLARKA I SZTAPLARKA
+	// =========================================================
+	//
+	// Ta sama struktura dla obu - rozni je tylko sekwencja.
+	// Szczeki maja wlasne rekordy w aCyl:
+	//   25  szczeki desztaplarki (stacja 3)
+	//   26  szczeki sztaplarki   (stacja 11)
+
+	St03	: ST_StackPersist;
+	St11	: ST_StackPersist;
+
+END_VAR
+]]></Declaration>
+  </GVL>
+</TcPlcObject>

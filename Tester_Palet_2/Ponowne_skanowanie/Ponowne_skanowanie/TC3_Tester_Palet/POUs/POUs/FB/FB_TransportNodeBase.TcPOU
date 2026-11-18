@@ -1,0 +1,1281 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_TransportNodeBase" Id="{7b2d0100-0000-4000-9000-000000000100}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_TransportNodeBase
+// =============================================================
+// WEZEL TRANSPORTU - KLASA BAZOWA
+// =============================================================
+//
+// Wspolne dla wszystkich 16 stacji: pamiec obecnosci w
+// zmiennych nieulotnych, weryfikacja pamieci wzgledem
+// czujnikow, watchdogi przejazdu, wznowienie po przerwaniu,
+// uzgadnianie przejazdu z sasiadem, tryb reczny.
+//
+// -------------------------------------------------------------
+// SZEW DLA KLAS POCHODNYCH
+// -------------------------------------------------------------
+// Klasa pochodna w swoim ciele:
+//   1. wypelnia wejscia czujnikow i napedu,
+//   2. wola SUPER^(),
+//   3. przepisuje xDrvRun / xDrvRev / lrDrvFreq na swoj aktuator.
+//
+// Dzieki temu logika sekwencji jest napisana RAZ i nie zalezy
+// od tego, czy wezel ma napedy rolkowe, lancuchowe czy zadne.
+//
+// -------------------------------------------------------------
+// DIAGNOSTYKA
+// -------------------------------------------------------------
+// Jesli wezel stoi, eWait mowi DOKLADNIE jednej rzeczy brakuje.
+// Warunki sa sprawdzane w stalej kolejnosci i pierwszy
+// niespelniony konczy cykl. Nie ma zagniezdzonych warunkow,
+// w ktorych "cos" moze byc nie tak.
+//
+// -------------------------------------------------------------
+// KONWENCJA ZAJETOSCI
+// -------------------------------------------------------------
+// Mem.xLoadPresent ustawiamy w chwili ROZPOCZECIA wjazdu, a
+// kasujemy dopiero po potwierdzonym zjezdzie. W trakcie
+// przejazdu oba wezly sa zajete - bo paleta fizycznie lezy
+// na obu. To jest zalozenie bezpieczne: po zaniku zasilania
+// wolimy jeden wezel za duzo do sprawdzenia niz kolizje.
+VAR_INPUT
+
+	// =========================================================
+	// STEROWANIE NADRZEDNE
+	// =========================================================
+
+	eMode			: E_MachineMode;
+
+	// TRUE = lancuch bezpieczenstwa zwolniony
+	xSafetyOK		: BOOL;
+
+	// Reczne zezwolenie na przejazdy miedzy stacjami.
+	// FALSE zatrzymuje wydawanie ladunkow, nie ruszajac niczego
+	// innego - sluzy do przechodzenia maszyny krok po kroku.
+	xTransferEnable	: BOOL := TRUE;
+
+
+	// =========================================================
+	// SZEW CZUJNIKOW - wypelnia klasa pochodna PRZED SUPER^()
+	// =========================================================
+
+	// Przynajmniej jeden czujnik jest wlaczony przez operatora
+	xSensUsable		: BOOL;
+
+	// Ladunek w pozycji zatrzymania
+	xSensLoadAtStop	: BOOL;
+
+	// Pole czujnikow calkowicie wolne
+	xSensLoadNone	: BOOL;
+
+	// Czujniki nie zgadzaja sie ze soba
+	xSensConflict	: BOOL;
+
+
+	// =========================================================
+	// SZEW NAPEDU - wypelnia klasa pochodna PRZED SUPER^()
+	// =========================================================
+
+	xDrvReady		: BOOL;
+	xDrvFault		: BOOL;
+
+END_VAR
+VAR_OUTPUT
+
+	// =========================================================
+	// SZEW NAPEDU - czyta klasa pochodna PO SUPER^()
+	// =========================================================
+
+	xDrvRun			: BOOL;
+	xDrvRev			: BOOL;
+	lrDrvFreq		: LREAL;
+
+
+	// =========================================================
+	// DIAGNOSTYKA
+	// =========================================================
+
+	eState			: E_NodeState;
+
+	// Jedyna przyczyna postoju w tym cyklu
+	eWait			: E_WaitCause;
+
+	eAlarm			: E_NodeAlarm;
+	xAlarm			: BOOL;
+
+	// Obraz z pamieci nieulotnej
+	xOccupied		: BOOL;
+	xLoadNok		: BOOL;
+
+	// Operacja stacji zostala przerwana w polowie
+	xOpInterrupted	: BOOL;
+
+	// TRUE = pamiec sie zmienila, menedzer ma ja zapisac
+	xPersistDirty	: BOOL;
+
+END_VAR
+VAR
+
+	// Numer wezla - wylacznie do diagnostyki i HMI
+	nNodeId			: INT;
+
+	// Rekord nieulotny wezla - GVL_PERSIST.aConv[nNodeId]
+	pP				: POINTER TO ST_ConvPersist;
+
+	// Sasiedzi w lancuchu transportu
+	pPrev			: POINTER TO FB_TransportNodeBase;
+	pNext			: POINTER TO FB_TransportNodeBase;
+
+	// Dokad przejsc po uplywie czasowki zatrzymania
+	eStopTarget		: E_NodeState := NODE_OCCUPIED;
+
+	eModeOld		: E_MachineMode;
+
+	tonStopDelay	: TON;
+	tonWatchdog		: TON;
+	tonBlind		: TON;
+	tonClear		: TON;
+	tonSettle		: TON;
+
+	xManFwd			: BOOL;
+	xManRev			: BOOL;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL WEZLA
+// =============================================================
+//
+// Kolejnosc warunkow jest czescia specyfikacji - nie zmieniac
+// bez zastanowienia. Pierwszy niespelniony warunek konczy cykl
+// i zostaje w eWait jako jednoznaczna przyczyna postoju.
+
+
+// -------------------------------------------------------------
+// 1. KONFIGURACJA
+// -------------------------------------------------------------
+
+IF pP = 0 THEN
+	M_HaltMotion();
+	eWait	:= WAIT_NOT_CONFIGURED;
+	eAlarm	:= ALM_NOT_CONFIGURED;
+	xAlarm	:= TRUE;
+	eState	:= NODE_ALARM;
+	RETURN;
+END_IF
+
+xOccupied		:= pP^.Mem.xLoadPresent;
+xLoadNok		:= pP^.Mem.xLoadNok;
+xOpInterrupted	:= pP^.Mem.xOperationInterrupted;
+xAlarm			:= (eAlarm <> ALM_NONE);
+
+
+// -------------------------------------------------------------
+// 2. BLAD NAPEDU
+// -------------------------------------------------------------
+
+IF xDrvFault THEN
+	M_MarkAborted();
+	M_RaiseAlarm(eNew := ALM_DRIVE_FAULT);
+END_IF
+
+
+// -------------------------------------------------------------
+// 3. ZEZWOLENIE BEZPIECZENSTWA
+// -------------------------------------------------------------
+//
+// Zanik STO w trakcie przejazdu zapamietujemy jako przerwany
+// ruch. Po resecie maszyna sprobuje go dokonczyc sama.
+
+IF NOT xSafetyOK THEN
+	M_MarkAborted();
+	M_MarkOperationInterrupted();
+	M_HaltMotion();
+	eWait := WAIT_NO_SAFETY;
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 4. TRYB RECZNY
+// -------------------------------------------------------------
+
+IF eMode = MODE_MANUAL THEN
+	eModeOld := eMode;
+	M_ManualCycle();
+	RETURN;
+END_IF
+
+IF eModeOld = MODE_MANUAL THEN
+	// Po recznej maszyna nie wie, gdzie sa palety - weryfikujemy
+	eState := NODE_INIT;
+END_IF
+
+eModeOld := eMode;
+
+
+// -------------------------------------------------------------
+// 5. ALARM
+// -------------------------------------------------------------
+
+IF xAlarm THEN
+	M_HaltMotion();
+	eWait	:= WAIT_ALARM_ACTIVE;
+	eState	:= NODE_ALARM;
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 6. PAMIEC NIEPOTWIERDZONA
+// -------------------------------------------------------------
+//
+// Rozjazd pamieci z czujnikami rozstrzyga operator -
+// M_ServiceSetEmpty albo M_ServiceSetLoaded.
+
+IF NOT pP^.Mem.xStateVerified THEN
+	M_HaltMotion();
+	eWait	:= WAIT_STATE_UNVERIFIED;
+	eState	:= NODE_VERIFY;
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 7. TRYB INNY NIZ AUTO
+// -------------------------------------------------------------
+
+IF eMode <> MODE_AUTO THEN
+	M_HaltMotion();
+	eWait := WAIT_NOT_AUTO;
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// 8. SEKWENCJA AUTOMATYCZNA
+// -------------------------------------------------------------
+
+eWait := WAIT_NONE;
+
+CASE eState OF
+
+NODE_INIT:
+	M_HaltMotion();
+	M_CheckConsistency();
+
+	IF NOT pP^.Mem.xStateVerified THEN
+		RETURN;
+	END_IF
+
+	IF NOT pP^.Mem.xLoadPresent THEN
+		eState := NODE_EMPTY;
+		RETURN;
+	END_IF
+
+	// Ladunek lezy, ale operacja stacji nie zostala dokonczona -
+	// wznawiamy ja zamiast wypuszczac nieprzebadana palete jako
+	// dobra. Tu wraca maszyna po zaniku zasilania w polowie testu.
+	IF M_OperationRequired() AND NOT pP^.Mem.xOperationDone THEN
+		pP^.Mem.xOperationInterrupted	:= TRUE;
+		xPersistDirty					:= TRUE;
+		eState							:= NODE_BUSY;
+		RETURN;
+	END_IF
+
+	eState := NODE_OCCUPIED;
+
+
+NODE_EMPTY:
+	M_HaltMotion();
+	eWait := WAIT_NO_LOAD;
+	M_CheckConsistency();
+
+
+NODE_INFEED:
+	M_RunForward();
+	M_CheckInfeedWatchdog();
+
+	// Hak dla stacji, ktore pracuja NA JADACEJ palecie -
+	// stacja 4 dociska deski w trakcie przejazdu, stacja 6
+	// skanuje profilometrem. Ich test konczy sie w chwili
+	// dojazdu do czujnikow, a nie zaczyna po zatrzymaniu.
+	M_TravelCycle();
+
+	IF M_ArrivalDetected() THEN
+		M_OnArrival();
+	END_IF
+
+
+NODE_STOP_DELAY:
+	// Ladunek jest juz w pozycji, jedziemy jeszcze przez
+	// czasowke ustawiona przez operatora
+	M_RunForward();
+
+	tonStopDelay(IN := TRUE, PT := pP^.Cfg.tStopDelay);
+
+	IF tonStopDelay.Q THEN
+		M_HaltMotion();
+		M_ResetTravelTimers();
+
+		pP^.Mem.xTransferAborted	:= FALSE;
+		pP^.Mem.nResumeCount		:= 0;
+		xPersistDirty				:= TRUE;
+
+		eState := eStopTarget;
+	END_IF
+
+
+NODE_BUSY:
+	M_HaltMotion();
+	eWait := WAIT_OPERATION_BUSY;
+
+	// Test przerwany na stacji, ktorej wyniku nie da sie
+	// powtorzyc - paleta idzie na odrzut i nie jest juz badana
+	IF pP^.Mem.xOperationInterrupted AND pP^.Cfg.xNokOnInterrupt THEN
+		pP^.Mem.xLoadNok	:= TRUE;
+		xPersistDirty		:= TRUE;
+	END_IF
+
+	IF M_OperationCycle() THEN
+		pP^.Mem.xOperationDone	:= TRUE;
+		xPersistDirty			:= TRUE;
+		eState					:= NODE_OCCUPIED;
+	END_IF
+
+
+NODE_OCCUPIED:
+	M_HaltMotion();
+	M_CheckConsistency();
+
+	IF eState = NODE_OCCUPIED THEN
+		M_TryRelease();
+	END_IF
+
+
+NODE_OUTFEED:
+	M_RunForward();
+	M_CheckOutfeedWatchdog();
+
+	IF M_ClearanceDetected() THEN
+		M_OnCleared();
+	END_IF
+
+
+NODE_VERIFY:
+	M_HaltMotion();
+	eWait := WAIT_STATE_UNVERIFIED;
+
+
+NODE_ALARM:
+	M_HaltMotion();
+	eWait := WAIT_ALARM_ACTIVE;
+
+
+ELSE
+	eState := NODE_INIT;
+
+END_CASE
+
+
+xOccupied		:= pP^.Mem.xLoadPresent;
+xLoadNok		:= pP^.Mem.xLoadNok;
+xOpInterrupted	:= pP^.Mem.xOperationInterrupted;
+xAlarm			:= (eAlarm <> ALM_NONE);
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_Config" Id="{7b2d0101-0000-4000-9000-000000000101}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Config
+// Podpiecie rekordu nieulotnego. Wolac raz, przy starcie.
+VAR_INPUT
+	nId			: INT;
+	pPersist	: POINTER TO ST_ConvPersist;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nNodeId	:= nId;
+pP		:= pPersist;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Link" Id="{7b2d0102-0000-4000-9000-000000000102}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Link
+// Podpiecie sasiadow w lancuchu transportu. Wolac raz.
+VAR_INPUT
+	pPrevNode	: POINTER TO FB_TransportNodeBase;
+	pNextNode	: POINTER TO FB_TransportNodeBase;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pPrev := pPrevNode;
+pNext := pNextNode;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_SetNext" Id="{7b2d0103-0000-4000-9000-000000000103}">
+      <Declaration><![CDATA[METHOD PUBLIC M_SetNext
+// Zmiana nastepnika w trakcie pracy. Uzywa tego stacja
+// rozjazdowa (8), ktora kieruje palete albo na sztaplarke,
+// albo na transporter poprzeczny odrzutu.
+VAR_INPUT
+	pNextNode	: POINTER TO FB_TransportNodeBase;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pNext := pNextNode;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManJog" Id="{7b2d0104-0000-4000-9000-000000000104}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ManJog
+// Komendy ruchu recznego. Dzialaja tylko w MODE_MANUAL.
+VAR_INPUT
+	xFwd	: BOOL;
+	xRev	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xManFwd := xFwd;
+xManRev := xRev;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d0105-0000-4000-9000-000000000105}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+// Reset maszyny przez operatora.
+//
+// Jesli przejazd zostal przerwany (STO, zanik zasilania,
+// watchdog), maszyna sama probuje go dokonczyc - wraca do
+// fazy, w ktorej stanela, i ponawia ruch. Liczba prob jest
+// nastawa operatora (nResumeRetries).
+//
+// Reset NIE potwierdza stanu pamieci. Jesli pamiec rozjechala
+// sie z czujnikami, decyzje podejmuje operator przyciskiem
+// "wezel pusty" albo "wezel zajety".
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_Reset := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+
+// ---------------------------------------------------------
+// PRZERWANY PRZEJAZD - PROBA AUTOMATYCZNEGO DOKONCZENIA
+// ---------------------------------------------------------
+
+IF pP^.Mem.xTransferAborted THEN
+
+	IF pP^.Mem.nResumeCount < pP^.Cfg.nResumeRetries THEN
+
+		pP^.Mem.nResumeCount	:= pP^.Mem.nResumeCount + 1;
+		xPersistDirty			:= TRUE;
+
+		eAlarm	:= ALM_NONE;
+		xAlarm	:= FALSE;
+
+		M_ResetTravelTimers();
+
+		eState	:= pP^.Mem.eAbortedPhase;
+		M_Reset	:= TRUE;
+		RETURN;
+
+	END_IF
+
+	// Proby wyczerpane - dalej decyduje czlowiek
+	pP^.Mem.xStateVerified	:= FALSE;
+	xPersistDirty			:= TRUE;
+
+	eAlarm	:= ALM_RESUME_FAILED;
+	xAlarm	:= TRUE;
+	eState	:= NODE_VERIFY;
+	RETURN;
+
+END_IF
+
+
+// ---------------------------------------------------------
+// ZWYKLE KASOWANIE ALARMU
+// ---------------------------------------------------------
+
+eAlarm	:= ALM_NONE;
+xAlarm	:= FALSE;
+
+M_ResetTravelTimers();
+
+eState	:= NODE_INIT;
+M_Reset	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ServiceSetEmpty" Id="{7b2d0106-0000-4000-9000-000000000106}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ServiceSetEmpty : BOOL
+// Awaryjne kasowanie stanu.
+//
+// Serwis fizycznie zabral palete albo stos i potwierdza
+// przyciskiem, ze wezel jest pusty. Kasuje pamiec, alarm
+// i flage przerwanego przejazdu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ServiceSetEmpty := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xLoadPresent		:= FALSE;
+pP^.Mem.xLoadNok			:= FALSE;
+pP^.Mem.nLoadId				:= 0;
+pP^.Mem.xOperationDone		:= FALSE;
+pP^.Mem.xOperationInterrupted	:= FALSE;
+pP^.Mem.xTransferAborted	:= FALSE;
+pP^.Mem.nResumeCount		:= 0;
+pP^.Mem.xStateVerified		:= TRUE;
+xPersistDirty				:= TRUE;
+
+eAlarm	:= ALM_NONE;
+xAlarm	:= FALSE;
+
+M_ResetTravelTimers();
+
+eState				:= NODE_INIT;
+M_ServiceSetEmpty	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ServiceSetLoaded" Id="{7b2d0107-0000-4000-9000-000000000107}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ServiceSetLoaded : BOOL
+// Operator potwierdza, ze na wezle LEZY ladunek i podaje
+// jego werdykt. Uzywane, gdy czujnik padl albo gdy paleta
+// zostala dolozona recznie.
+VAR_INPUT
+	xNok	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ServiceSetLoaded := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xLoadPresent		:= TRUE;
+pP^.Mem.xLoadNok			:= xNok;
+// Paleta dolozona recznie nie byla badana - stacja ma to zrobic
+pP^.Mem.xOperationDone		:= FALSE;
+pP^.Mem.xOperationInterrupted	:= FALSE;
+pP^.Mem.xTransferAborted	:= FALSE;
+pP^.Mem.nResumeCount		:= 0;
+pP^.Mem.xStateVerified		:= TRUE;
+xPersistDirty				:= TRUE;
+
+eAlarm	:= ALM_NONE;
+xAlarm	:= FALSE;
+
+M_ResetTravelTimers();
+
+eState				:= NODE_INIT;
+M_ServiceSetLoaded	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_InjectLoad" Id="{7b2d0120-0000-4000-9000-000000000120}">
+      <Declaration><![CDATA[METHOD PUBLIC M_InjectLoad : BOOL
+// Ladunek pojawia sie na wezle INNA droga niz transporterem.
+//
+// Operator wstawia stos na stacji 1, desztaplarka wydaje
+// pojedyncza palete spod uniesionego stosu. W obu przypadkach
+// nie bylo zadnego przejazdu, wiec wezel od razu przechodzi
+// w stan zajety.
+VAR_INPUT
+	xNok	: BOOL;
+	nLoadId	: UDINT;
+
+	// TRUE = stacja ma juz ten ladunek obsluzony i moze go
+	// wydac bez dalszej operacji
+	xOpDone	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_InjectLoad := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xLoadPresent			:= TRUE;
+pP^.Mem.xLoadNok				:= xNok;
+pP^.Mem.nLoadId					:= nLoadId;
+pP^.Mem.xOperationDone			:= xOpDone;
+pP^.Mem.xOperationInterrupted	:= FALSE;
+pP^.Mem.xTransferAborted		:= FALSE;
+pP^.Mem.nResumeCount			:= 0;
+pP^.Mem.xStateVerified			:= TRUE;
+xPersistDirty					:= TRUE;
+
+M_ResetTravelTimers();
+
+eState			:= NODE_OCCUPIED;
+M_InjectLoad	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ClearLoad" Id="{7b2d0121-0000-4000-9000-000000000121}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ClearLoad : BOOL
+// Ladunek opuscil wezel INNA droga niz transporterem -
+// sztaplarka zabrala palete w gore, na szczeki.
+//
+// Nie myl tego z M_ServiceSetEmpty: tam operator rozstrzyga
+// niezgodnosc pamieci z czujnikami, tu maszyna wie, co zrobila.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ClearLoad := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xLoadPresent			:= FALSE;
+pP^.Mem.xLoadNok				:= FALSE;
+pP^.Mem.nLoadId					:= 0;
+pP^.Mem.xOperationDone			:= FALSE;
+pP^.Mem.xOperationInterrupted	:= FALSE;
+pP^.Mem.xTransferAborted		:= FALSE;
+pP^.Mem.nResumeCount			:= 0;
+xPersistDirty					:= TRUE;
+
+M_HaltMotion();
+M_ResetTravelTimers();
+
+eState		:= NODE_EMPTY;
+M_ClearLoad	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_AckPersist" Id="{7b2d0108-0000-4000-9000-000000000108}">
+      <Declaration><![CDATA[METHOD PUBLIC M_AckPersist
+// Menedzer zapisu danych nieulotnych potwierdza zapis.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xPersistDirty := FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CanAccept" Id="{7b2d0109-0000-4000-9000-000000000109}">
+      <Declaration><![CDATA[METHOD PUBLIC M_CanAccept : BOOL
+// Czy wezel moze przyjac ladunek. Pyta o to poprzednik.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_CanAccept := (M_WhyCannotAccept() = WAIT_NONE);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_WhyCannotAccept" Id="{7b2d010a-0000-4000-9000-00000000010a}">
+      <Declaration><![CDATA[METHOD PUBLIC M_WhyCannotAccept : E_WaitCause
+// Jedna, konkretna przyczyna odmowy przyjecia ladunku.
+// Poprzednik przepisuje ja do swojego eWait, dzieki czemu
+// na HMI widac nie "wezel czeka", tylko czego dokladnie
+// brakuje i po ktorej stronie.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_WhyCannotAccept := WAIT_NONE;
+
+IF pP = 0 THEN
+	M_WhyCannotAccept := WAIT_NOT_CONFIGURED;
+	RETURN;
+END_IF
+
+IF NOT xSafetyOK THEN
+	M_WhyCannotAccept := WAIT_NEXT_NO_SAFETY;
+	RETURN;
+END_IF
+
+IF eMode <> MODE_AUTO THEN
+	M_WhyCannotAccept := WAIT_NEXT_NOT_AUTO;
+	RETURN;
+END_IF
+
+IF eAlarm <> ALM_NONE THEN
+	M_WhyCannotAccept := WAIT_NEXT_ALARM;
+	RETURN;
+END_IF
+
+IF NOT pP^.Mem.xStateVerified THEN
+	M_WhyCannotAccept := WAIT_NEXT_UNVERIFIED;
+	RETURN;
+END_IF
+
+IF pP^.Mem.xLoadPresent THEN
+	M_WhyCannotAccept := WAIT_NEXT_OCCUPIED;
+	RETURN;
+END_IF
+
+IF eState = NODE_BUSY THEN
+	M_WhyCannotAccept := WAIT_NEXT_BUSY;
+	RETURN;
+END_IF
+
+IF eState <> NODE_EMPTY THEN
+	M_WhyCannotAccept := WAIT_NEXT_OCCUPIED;
+	RETURN;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_RequiresPrevStop" Id="{7b2d010b-0000-4000-9000-00000000010b}">
+      <Declaration><![CDATA[METHOD PUBLIC M_RequiresPrevStop : BOOL
+// Czy poprzednik MUSI zatrzymac ladunek u siebie.
+//
+// Wezel z wylaczonymi oboma czujnikami mierzy przejazd
+// czasowka. Zeby ten czas cokolwiek znaczyl, ladunek musi
+// ruszac zawsze z tego samego miejsca - wiec poprzednik
+// nie ma prawa przepuscic go bez zatrzymania.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pP = 0 THEN
+	M_RequiresPrevStop := TRUE;
+	RETURN;
+END_IF
+
+M_RequiresPrevStop := NOT (pP^.Cfg.xSensor1Enabled OR pP^.Cfg.xSensor2Enabled);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_BeginInfeed" Id="{7b2d010c-0000-4000-9000-00000000010c}">
+      <Declaration><![CDATA[METHOD PUBLIC M_BeginInfeed
+// Poprzednik zaczyna wydawanie. Oba wezly rusza w tym samym
+// cyklu - ten przechodzi na NODE_INFEED, tamten na NODE_OUTFEED.
+VAR_INPUT
+	pSource		: POINTER TO FB_TransportNodeBase;
+	xNok		: BOOL;
+	nLoadId		: UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pP = 0 THEN
+	RETURN;
+END_IF
+
+pPrev := pSource;
+
+// Zajetosc ustawiamy JUZ TERAZ - paleta wchodzi na wezel
+pP^.Mem.xLoadPresent		:= TRUE;
+pP^.Mem.xLoadNok			:= xNok;
+pP^.Mem.nLoadId				:= nLoadId;
+pP^.Mem.xOperationDone		:= FALSE;
+pP^.Mem.xOperationInterrupted	:= FALSE;
+pP^.Mem.xTransferAborted	:= FALSE;
+pP^.Mem.nResumeCount		:= 0;
+xPersistDirty				:= TRUE;
+
+M_ResetTravelTimers();
+
+eState := NODE_INFEED;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_TryRelease" Id="{7b2d010d-0000-4000-9000-00000000010d}">
+      <Declaration><![CDATA[METHOD PROTECTED M_TryRelease : BOOL
+// Proba wydania ladunku dalej. Jesli nastepnik jest gotowy,
+// oba transportery rusza w tym samym cyklu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_TryRelease := FALSE;
+
+IF NOT xTransferEnable THEN
+	eWait := WAIT_TRANSFER_HOLD;
+	RETURN;
+END_IF
+
+IF pNext = 0 THEN
+	eWait := WAIT_NEXT_NOT_LINKED;
+	RETURN;
+END_IF
+
+eWait := pNext^.M_WhyCannotAccept();
+
+IF eWait <> WAIT_NONE THEN
+	RETURN;
+END_IF
+
+pNext^.M_BeginInfeed(
+	pSource	:= ADR(THIS^),
+	xNok	:= pP^.Mem.xLoadNok,
+	nLoadId	:= pP^.Mem.nLoadId
+);
+
+M_ResetTravelTimers();
+
+eState			:= NODE_OUTFEED;
+M_TryRelease	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_PassThroughPossible" Id="{7b2d010e-0000-4000-9000-00000000010e}">
+      <Declaration><![CDATA[METHOD PROTECTED M_PassThroughPossible : BOOL
+// Czy mozna przepuscic ladunek bez zatrzymania.
+//
+// Sens: jesli na tym wezle nie ma nic do zrobienia, a
+// nastepny czeka na palete, to zatrzymywanie jej tutaj
+// tylko traci czas i zuzywa maszyne.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_PassThroughPossible := FALSE;
+
+IF NOT pP^.Cfg.xAllowPassThrough THEN
+	RETURN;
+END_IF
+
+IF pNext = 0 THEN
+	RETURN;
+END_IF
+
+// Nastepnik jedzie na czasowke - potrzebuje powtarzalnego
+// punktu startu, wiec musimy zatrzymac palete u siebie
+IF pNext^.M_RequiresPrevStop() THEN
+	RETURN;
+END_IF
+
+IF NOT pNext^.M_CanAccept() THEN
+	RETURN;
+END_IF
+
+M_PassThroughPossible := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OnArrival" Id="{7b2d010f-0000-4000-9000-00000000010f}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OnArrival
+// Ladunek dojechal do pozycji koncowej. Trzy mozliwosci,
+// sprawdzane w tej kolejnosci.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ResetTravelTimers();
+
+
+// 1. Stacja ma cos do zrobienia - zatrzymujemy zawsze
+IF M_OperationRequired() THEN
+	eStopTarget	:= NODE_BUSY;
+	eState		:= NODE_STOP_DELAY;
+	RETURN;
+END_IF
+
+
+// 2. Nie ma nic do zrobienia, nastepnik czeka - jedziemy dalej
+IF M_PassThroughPossible() THEN
+	IF M_TryRelease() THEN
+		RETURN;
+	END_IF
+END_IF
+
+
+// 3. Zatrzymanie w pozycji koncowej
+eStopTarget	:= NODE_OCCUPIED;
+eState		:= NODE_STOP_DELAY;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OnCleared" Id="{7b2d0110-0000-4000-9000-000000000110}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OnCleared
+// Ladunek potwierdzenie zjechal z wezla.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pP^.Mem.xLoadPresent		:= FALSE;
+pP^.Mem.xLoadNok			:= FALSE;
+pP^.Mem.nLoadId				:= 0;
+pP^.Mem.xOperationDone		:= FALSE;
+pP^.Mem.xOperationInterrupted	:= FALSE;
+pP^.Mem.xTransferAborted	:= FALSE;
+pP^.Mem.nResumeCount		:= 0;
+xPersistDirty				:= TRUE;
+
+M_HaltMotion();
+M_ResetTravelTimers();
+
+eState := NODE_EMPTY;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ArrivalDetected" Id="{7b2d0111-0000-4000-9000-000000000111}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ArrivalDetected : BOOL
+// Wykrycie pozycji koncowej. Przy wylaczonych obu czujnikach
+// zastepuje je czasowka nastawiana przez operatora.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xSensUsable THEN
+	tonBlind(IN := FALSE);
+	M_ArrivalDetected := xSensLoadAtStop;
+	RETURN;
+END_IF
+
+tonBlind(IN := TRUE, PT := pP^.Cfg.tBlindTravel);
+M_ArrivalDetected := tonBlind.Q;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ClearanceDetected" Id="{7b2d0112-0000-4000-9000-000000000112}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ClearanceDetected : BOOL
+// Potwierdzenie, ze ladunek zszedl z pola czujnikow.
+VAR
+	xFree	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xSensUsable THEN
+	tonBlind(IN := FALSE);
+	xFree := xSensLoadNone;
+ELSE
+	tonBlind(IN := TRUE, PT := pP^.Cfg.tBlindTravel);
+	xFree := tonBlind.Q;
+END_IF
+
+tonClear(IN := xFree, PT := pP^.Cfg.tClearDelay);
+
+M_ClearanceDetected := tonClear.Q;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CheckInfeedWatchdog" Id="{7b2d0113-0000-4000-9000-000000000113}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CheckInfeedWatchdog
+// Paleta miala dojechac i nie dojechala - zaciecie, poslizg,
+// urwany lancuch. Zatrzymujemy i wolamy operatora.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[tonWatchdog(IN := TRUE, PT := pP^.Cfg.tInfeedWatchdog);
+
+IF NOT tonWatchdog.Q THEN
+	RETURN;
+END_IF
+
+M_MarkAborted();
+M_RaiseAlarm(eNew := ALM_INFEED_TIMEOUT);
+eState := NODE_ALARM;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CheckOutfeedWatchdog" Id="{7b2d0114-0000-4000-9000-000000000114}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CheckOutfeedWatchdog
+// Paleta miala zjechac i nie zjechala.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[tonWatchdog(IN := TRUE, PT := pP^.Cfg.tOutfeedWatchdog);
+
+IF NOT tonWatchdog.Q THEN
+	RETURN;
+END_IF
+
+M_MarkAborted();
+M_RaiseAlarm(eNew := ALM_OUTFEED_TIMEOUT);
+eState := NODE_ALARM;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CheckConsistency" Id="{7b2d0115-0000-4000-9000-000000000115}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CheckConsistency
+// Weryfikacja pamieci wzgledem czujnikow. Wolana na postoju:
+// po zatrzymaniu, w stanie pustym i przy starcie.
+//
+// Niezgodnosc musi utrzymac sie przez tSensorSettle, zeby nie
+// lapac drgan i kostek palety migajacych czujnikowi.
+VAR
+	eDetect	: E_NodeAlarm;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT xSensUsable THEN
+	tonSettle(IN := FALSE);
+	RETURN;
+END_IF
+
+// Stacje, ktore zdejmuja ladunek z transportera wlasna mechanika
+// (desztaplarka, sztaplarka), wstrzymuja to porownanie na czas
+// swojego cyklu - patrz M_SensorCheckAllowed.
+IF NOT M_SensorCheckAllowed() THEN
+	tonSettle(IN := FALSE);
+	RETURN;
+END_IF
+
+eDetect := ALM_NONE;
+
+IF pP^.Mem.xLoadPresent THEN
+
+	IF xSensLoadNone THEN
+		// Pamiec mowi "zajete", czujniki nie widza nic
+		eDetect := ALM_LOAD_LOST;
+	ELSIF xSensConflict THEN
+		// Jeden czujnik widzi, drugi nie - paleta krzywo
+		// albo czujnik padl
+		eDetect := ALM_SENSOR_DISAGREE;
+	END_IF
+
+ELSE
+
+	IF NOT xSensLoadNone THEN
+		// Pamiec mowi "pusto", a cos tam lezy
+		eDetect := ALM_UNEXPECTED_LOAD;
+	END_IF
+
+END_IF
+
+
+tonSettle(IN := (eDetect <> ALM_NONE), PT := pP^.Cfg.tSensorSettle);
+
+IF NOT tonSettle.Q THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xStateVerified	:= FALSE;
+xPersistDirty			:= TRUE;
+
+M_RaiseAlarm(eNew := eDetect);
+eState := NODE_VERIFY;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MarkAborted" Id="{7b2d0116-0000-4000-9000-000000000116}">
+      <Declaration><![CDATA[METHOD PROTECTED M_MarkAborted
+// Zapamietanie, ze ruch zostal przerwany w polowie. Po
+// resecie maszyna wroci dokladnie do tej fazy i sprobuje
+// dokonczyc przejazd.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF (eState <> NODE_INFEED) AND (eState <> NODE_OUTFEED) AND (eState <> NODE_STOP_DELAY) THEN
+	RETURN;
+END_IF
+
+IF pP^.Mem.xTransferAborted THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xTransferAborted	:= TRUE;
+pP^.Mem.eAbortedPhase		:= eState;
+xPersistDirty				:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MarkOperationInterrupted" Id="{7b2d011e-0000-4000-9000-00000000011e}">
+      <Declaration><![CDATA[METHOD PROTECTED M_MarkOperationInterrupted
+// Operacja stacji zostala przerwana w polowie.
+//
+// Sama flaga nie przesadza o losie palety - o tym decyduje
+// Cfg.xNokOnInterrupt. Na stacjach 4 i 6 wyniku przerwanego
+// testu nie da sie uznac za wiarygodny, wiec paleta idzie na
+// odrzut. Na pozostalych mozna kontynuowac albo powtorzyc cykl.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF eState <> NODE_BUSY THEN
+	RETURN;
+END_IF
+
+IF pP^.Mem.xOperationInterrupted THEN
+	RETURN;
+END_IF
+
+pP^.Mem.xOperationInterrupted	:= TRUE;
+xPersistDirty					:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_RaiseAlarm" Id="{7b2d0117-0000-4000-9000-000000000117}">
+      <Declaration><![CDATA[METHOD PROTECTED M_RaiseAlarm
+// Pierwszy alarm zostaje - kolejne go nie nadpisza, zeby
+// operator widzial przyczyne, a nie skutek.
+VAR_INPUT
+	eNew	: E_NodeAlarm;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF eNew = ALM_NONE THEN
+	RETURN;
+END_IF
+
+IF eAlarm = ALM_NONE THEN
+	eAlarm := eNew;
+END_IF
+
+xAlarm := TRUE;
+
+// Alarm w trakcie operacji to przerwanie testu - grzyb,
+// kurtyna, przeciazenie napedu. Na stacjach 4 i 6 unieważnia
+// wynik, na pozostalych tylko wstrzymuje cykl.
+M_MarkOperationInterrupted();
+
+M_HaltMotion();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_HaltMotion" Id="{7b2d0118-0000-4000-9000-000000000118}">
+      <Declaration><![CDATA[METHOD PROTECTED M_HaltMotion
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xDrvRun		:= FALSE;
+xDrvRev		:= FALSE;
+lrDrvFreq	:= 0.0;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_RunForward" Id="{7b2d0119-0000-4000-9000-000000000119}">
+      <Declaration><![CDATA[METHOD PROTECTED M_RunForward
+// W AUTO transporter jedzie zawsze do przodu.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[xDrvRun		:= TRUE;
+xDrvRev		:= FALSE;
+lrDrvFreq	:= pP^.Cfg.lrFreqAuto;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ResetTravelTimers" Id="{7b2d011a-0000-4000-9000-00000000011a}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ResetTravelTimers
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[tonWatchdog(IN := FALSE);
+tonBlind(IN := FALSE);
+tonClear(IN := FALSE);
+tonStopDelay(IN := FALSE);
+tonSettle(IN := FALSE);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManualCycle" Id="{7b2d011b-0000-4000-9000-00000000011b}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ManualCycle
+// Praca reczna: ruch w obie strony, bez uzgadniania z
+// sasiadami i bez watchdogow. Pamiec obecnosci NIE jest
+// aktualizowana - po powrocie do AUTO wezel przechodzi
+// przez NODE_INIT i weryfikuje stan czujnikami.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[eState	:= NODE_MANUAL;
+eWait	:= WAIT_NONE;
+
+M_ResetTravelTimers();
+
+IF xManFwd AND NOT xManRev THEN
+	xDrvRun		:= TRUE;
+	xDrvRev		:= FALSE;
+	lrDrvFreq	:= pP^.Cfg.lrFreqManual;
+	RETURN;
+END_IF
+
+IF xManRev AND NOT xManFwd THEN
+	xDrvRun		:= TRUE;
+	xDrvRev		:= TRUE;
+	lrDrvFreq	:= pP^.Cfg.lrFreqManual;
+	RETURN;
+END_IF
+
+M_HaltMotion();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationRequired" Id="{7b2d011c-0000-4000-9000-00000000011c}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationRequired : BOOL
+// HAK DLA STACJI TECHNOLOGICZNYCH.
+//
+// TRUE = paleta musi sie tu zatrzymac, bo jest co robic.
+// Klasa pochodna nadpisuje i uwzglednia:
+//   - Cfg.xStationEnabled (operator wylaczyl stacje),
+//   - Mem.xLoadNok (paleta odrzucona - zadnych dalszych testow).
+//
+// Domyslnie wezel jest samym transporterem.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationRequired := FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_SensorCheckAllowed" Id="{7b2d0122-0000-4000-9000-000000000122}">
+      <Declaration><![CDATA[METHOD PROTECTED M_SensorCheckAllowed : BOOL
+// HAK DLA STACJI Z WLASNA MECHANIKA NAD TRANSPORTEREM.
+//
+// FALSE wstrzymuje porownanie pamieci z czujnikami. Potrzebuja
+// tego desztaplarka i sztaplarka: u nich stos potrafi wisiec na
+// szczekach albo schodzic na transporter w chwili, gdy pamiec
+// wezla mowi "pusto", i odwrotnie.
+//
+// Domyslnie TRUE - zwykly transporter porownuje zawsze.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_SensorCheckAllowed := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_TravelCycle" Id="{7b2d011f-0000-4000-9000-00000000011f}">
+      <Declaration><![CDATA[METHOD PROTECTED M_TravelCycle
+// HAK DLA STACJI PRACUJACYCH NA JADACEJ PALECIE.
+//
+// Wolany w kazdym cyklu, gdy ladunek wjezdza na wezel.
+//
+// Stacja 4 dociska deski rolkami w trakcie przejazdu, stacja 6
+// skanuje profilometrem milimetr po milimetrze. Dla nich test
+// nie zaczyna sie po zatrzymaniu - on trwa CALY przejazd
+// i konczy sie w chwili dojazdu do czujnikow.
+//
+// Wlasnie dlatego przerwanie na tych stacjach uniewaznia wynik:
+// paleta zatrzymuje sie w nieznanym miejscu, a po wznowieniu
+// nie da sie odtworzyc warunkow, w ktorych badanie sie toczylo.
+//
+// Domyslnie pusty - zwykly transporter nic po drodze nie robi.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationCycle" Id="{7b2d011d-0000-4000-9000-00000000011d}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationCycle : BOOL
+// HAK DLA STACJI TECHNOLOGICZNYCH.
+// TRUE = operacja zakonczona, paleta moze jechac dalej.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationCycle := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

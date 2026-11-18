@@ -1,0 +1,502 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_Station03_Destack" Id="{7b2d0800-0000-4000-9000-000000000800}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Station03_Destack EXTENDS FB_RollerConveyor
+// =============================================================
+// STACJA 3 - DESZTAPLARKA
+// =============================================================
+//
+// Rozdziela stos na pojedyncze palety. Wozek ze szczekami chwyta
+// pod DRUGA palete od dolu i unosi caly stos - najnizsza paleta
+// zostaje na transporterze i moze wyjechac.
+//
+// -------------------------------------------------------------
+// CYKL
+// -------------------------------------------------------------
+//   w trakcie wjazdu   szczeki otwarte, wozek jedzie na SRODEK
+//   po potwierdzeniu   zapamietanie, ze stos dojechal
+//   chwyt              szczeki zamykaja sie pod druga paleta
+//   uniesienie         wozek na GORE, dolna paleta wolna
+//   wydanie            paleta wyjezdza na stacje 4
+//   odlozenie          wozek na DOL, szczeki otwarte
+//   i od nowa, az stos sie skonczy
+//
+// -------------------------------------------------------------
+// OSTATNIA PALETA
+// -------------------------------------------------------------
+// Gdy na transporterze zostaje JEDNA paleta, nie ma juz czego
+// chwytac - nie ma drugiej palety od dolu. Ostatnia sztuka
+// wyjezdza wprost z transportera, bez unoszenia.
+//
+// -------------------------------------------------------------
+// LICZBA PALET
+// -------------------------------------------------------------
+// Na razie stala, z Cfg.nStackSize. Czujnik wykrywajacy, ze stos
+// sie skonczyl, dojdzie pozniej - wtedy licznik bedzie tylko
+// wartoscia oczekiwana, a prawde powie czujnik.
+VAR_INPUT
+
+	// Enkoder absolutny wozka
+	diLiftPosRaw	: DINT;
+
+	// Krancowki szczek
+	xJawClosedSw	: BOOL;
+	xJawOpenSw		: BOOL;
+
+END_VAR
+VAR_OUTPUT
+
+	// Cewki szczek - stacja przepisuje je na swoje wyjscia
+	xJawCoilClose	: BOOL;
+	xJawCoilOpen	: BOOL;
+
+	nStep			: INT;
+
+	// Ile palet zostalo do wydania z biezacego stosu
+	nRemaining		: INT;
+
+	diLiftPos		: DINT;
+	nLiftTarget		: INT;
+	xLiftInPos		: BOOL;
+
+	eLiftAlarm		: E_StackAlarm;
+
+END_VAR
+VAR
+
+	pSt		: POINTER TO ST_StackPersist;
+	fbLift	: FB_StackLift;
+
+	nNextId	: UDINT;
+
+END_VAR
+VAR CONSTANT
+
+	ST3_IDLE		: INT := 0;
+	ST3_PREPOS		: INT := 10;
+	ST3_GRIP		: INT := 20;
+	ST3_LIFT		: INT := 30;
+	ST3_HANDOVER	: INT := 40;
+	ST3_WAIT_CLEAR	: INT := 50;
+	ST3_LOWER		: INT := 60;
+	ST3_OPEN		: INT := 70;
+	ST3_LAST		: INT := 80;
+	ST3_EMPTYSTACK	: INT := 90;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL STACJI 3
+// =============================================================
+
+
+// 1. Wozek ze szczekami
+M_CallLift();
+
+
+// 2. Warstwa transportu
+SUPER^();
+
+
+// 3. Sekwencja desztaplowania.
+//    Chodzi w KAZDYM stanie wezla, nie tylko w NODE_BUSY:
+//    odkladanie stosu i chwyt nastepnej palety odbywaja sie
+//    wtedy, gdy wezel jest juz pusty po wydaniu poprzedniej.
+M_DestackCycle();
+
+
+// 4. Diagnostyka
+M_MapStatus();
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_ConfigStation" Id="{7b2d0801-0000-4000-9000-000000000801}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ConfigStation
+// Wolac raz, przy starcie, PO M_Config klasy bazowej.
+VAR_INPUT
+	pStPersist	: POINTER TO ST_StackPersist;
+
+	// Falownik 1 - krzywka desztaplarki
+	pLiftDrive	: POINTER TO FB_NordSK550PP;
+
+	// Rekord silownika szczek
+	nJawId		: INT;
+	pJawPersist	: POINTER TO ST_CylPersist;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pSt := pStPersist;
+
+fbLift.M_Config(
+	pPersist	:= pStPersist,
+	pDrv		:= pLiftDrive,
+	nJawId		:= nJawId,
+	pJawPersist	:= pJawPersist
+);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CallLift" Id="{7b2d0802-0000-4000-9000-000000000802}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CallLift
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbLift(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	diPosRaw		:= diLiftPosRaw,
+	xJawClosedSw	:= xJawClosedSw,
+	xJawOpenSw		:= xJawOpenSw
+);
+
+xJawCoilClose	:= fbLift.xJawCoilClose;
+xJawCoilOpen	:= fbLift.xJawCoilOpen;
+
+IF fbLift.xAlarm THEN
+	M_RaiseAlarm(eNew := ALM_OPERATION_FAILED);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MapStatus" Id="{7b2d0803-0000-4000-9000-000000000803}">
+      <Declaration><![CDATA[METHOD PROTECTED M_MapStatus
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[diLiftPos	:= fbLift.diPos;
+nLiftTarget	:= fbLift.nTargetSel;
+xLiftInPos	:= fbLift.xInPosition;
+eLiftAlarm	:= fbLift.eAlarm;
+
+IF pSt <> 0 THEN
+	nRemaining := pSt^.Mem.nRemaining;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_StackArrived" Id="{7b2d0804-0000-4000-9000-000000000804}">
+      <Declaration><![CDATA[METHOD PUBLIC M_StackArrived : BOOL
+// Stos dojechal do pozycji i zostal potwierdzony czujnikami.
+//
+// Liczbe palet zapisujemy W PAMIECI NIEULOTNEJ - po zaniku
+// zasilania maszyna musi wiedziec, ile sztuk zostalo jeszcze
+// w stosie stojacym na stacji.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_StackArrived := FALSE;
+
+IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+IF pSt^.Mem.xStackArrived THEN
+	RETURN;
+END_IF
+
+pSt^.Mem.xStackArrived	:= TRUE;
+pSt^.Mem.nRemaining		:= pSt^.Cfg.nStackSize;
+xPersistDirty			:= TRUE;
+
+M_StackArrived := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationRequired" Id="{7b2d0805-0000-4000-9000-000000000805}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationRequired : BOOL
+// Stos musi sie zatrzymac i zostac rozdzielony. Pojedyncza
+// paleta wydana przez desztaplarke jest juz obsluzona -
+// M_InjectLoad ustawia jej xOperationDone.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationRequired := TRUE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF NOT pP^.Cfg.xStationEnabled THEN
+	M_OperationRequired := FALSE;
+	RETURN;
+END_IF
+
+M_OperationRequired := NOT pP^.Mem.xOperationDone;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationCycle" Id="{7b2d0806-0000-4000-9000-000000000806}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationCycle : BOOL
+// Wezel czeka, az desztaplarka odseparuje pierwsza palete.
+// Wlasciwa sekwencja siedzi w M_DestackCycle, bo musi dzialac
+// takze wtedy, gdy wezel jest pusty.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationCycle := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+M_OperationCycle := pP^.Mem.xOperationDone;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_TravelCycle" Id="{7b2d0807-0000-4000-9000-000000000807}">
+      <Declaration><![CDATA[METHOD PROTECTED M_TravelCycle
+// W trakcie wjazdu stosu wozek ma byc otwarty i stac na
+// pozycji chwytu - zeby po potwierdzeniu czujnikami od razu
+// mozna bylo zamknac szczeki.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nStep <> ST3_IDLE THEN
+	RETURN;
+END_IF
+
+fbLift.M_JawsOpen();
+fbLift.M_MoveTo(nSel := 2);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_DestackCycle" Id="{7b2d0808-0000-4000-9000-000000000808}">
+      <Declaration><![CDATA[METHOD PROTECTED M_DestackCycle
+// Sekwencja desztaplowania.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF NOT xSafetyOK THEN
+	RETURN;
+END_IF
+
+IF xAlarm THEN
+	RETURN;
+END_IF
+
+IF eMode <> MODE_AUTO THEN
+	RETURN;
+END_IF
+
+// Stacja wylaczona przez operatora - stos przejezdza w calosci,
+// bez rozdzielania. Uzywane przy uruchomieniu transportu.
+IF NOT pP^.Cfg.xStationEnabled THEN
+	nStep := ST3_IDLE;
+	RETURN;
+END_IF
+
+
+CASE nStep OF
+
+ST3_IDLE:
+	// Czekamy, az stos zatrzyma sie na czujnikach
+	IF NOT pP^.Mem.xLoadPresent THEN
+		RETURN;
+	END_IF
+
+	IF (eState <> NODE_BUSY) AND (eState <> NODE_OCCUPIED) THEN
+		RETURN;
+	END_IF
+
+	M_StackArrived();
+
+	IF pSt^.Mem.nRemaining <= 1 THEN
+		nStep := ST3_LAST;
+		RETURN;
+	END_IF
+
+	nStep := ST3_PREPOS;
+
+
+ST3_PREPOS:
+	// Szczeki otwarte, wozek pod druga palete od dolu
+	fbLift.M_JawsOpen();
+
+	IF NOT fbLift.xJawsOpen THEN
+		RETURN;
+	END_IF
+
+	IF fbLift.M_MoveTo(nSel := 2) THEN
+		nStep := ST3_GRIP;
+	END_IF
+
+
+ST3_GRIP:
+	// Szczeki wchodza w deski drugiej palety od dolu
+	IF fbLift.M_JawsClose() THEN
+		pSt^.Mem.xJawsLoaded	:= TRUE;
+		xPersistDirty			:= TRUE;
+		nStep					:= ST3_LIFT;
+	END_IF
+
+
+ST3_LIFT:
+	// Uniesienie stosu - najnizsza paleta zostaje na transporterze
+	IF fbLift.M_MoveTo(nSel := 3) THEN
+		nStep := ST3_HANDOVER;
+	END_IF
+
+
+ST3_HANDOVER:
+	// Odseparowana paleta staje sie ladunkiem wezla i moze jechac
+	nNextId := pP^.Mem.nLoadId;
+	M_InjectLoad(xNok := FALSE, nLoadId := nNextId, xOpDone := TRUE);
+	nStep := ST3_WAIT_CLEAR;
+
+
+ST3_WAIT_CLEAR:
+	// Czekamy, az paleta zjedzie ze stacji
+	IF pP^.Mem.xLoadPresent THEN
+		RETURN;
+	END_IF
+
+	pSt^.Mem.nRemaining	:= pSt^.Mem.nRemaining - 1;
+	xPersistDirty		:= TRUE;
+
+	IF pSt^.Mem.nRemaining <= 0 THEN
+		nStep := ST3_EMPTYSTACK;
+		RETURN;
+	END_IF
+
+	nStep := ST3_LOWER;
+
+
+ST3_LOWER:
+	// Odlozenie stosu na transporter
+	IF fbLift.M_MoveTo(nSel := 1) THEN
+		nStep := ST3_OPEN;
+	END_IF
+
+
+ST3_OPEN:
+	IF fbLift.M_JawsOpen() THEN
+		pSt^.Mem.xJawsLoaded	:= FALSE;
+		xPersistDirty			:= TRUE;
+
+		// Ostatnia paleta nie ma nad soba drugiej - wyjezdza
+		// wprost z transportera, bez unoszenia
+		IF pSt^.Mem.nRemaining <= 1 THEN
+			nStep := ST3_LAST;
+			RETURN;
+		END_IF
+
+		nStep := ST3_PREPOS;
+	END_IF
+
+
+ST3_LAST:
+	// Jedna paleta na transporterze - wydajemy ja bez chwytania
+	fbLift.M_JawsOpen();
+	fbLift.M_MoveTo(nSel := 2);
+
+	nNextId := pP^.Mem.nLoadId;
+	M_InjectLoad(xNok := FALSE, nLoadId := nNextId, xOpDone := TRUE);
+
+	nStep := ST3_WAIT_CLEAR;
+
+
+ST3_EMPTYSTACK:
+	// Stos wydany w calosci - stacja gotowa na nastepny
+	pSt^.Mem.xStackArrived	:= FALSE;
+	pSt^.Mem.nRemaining		:= 0;
+	pSt^.Mem.xJawsLoaded	:= FALSE;
+	xPersistDirty			:= TRUE;
+
+	fbLift.M_JawsOpen();
+	fbLift.M_MoveTo(nSel := 2);
+
+	nStep := ST3_IDLE;
+
+
+ELSE
+	nStep := ST3_IDLE;
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_SensorCheckAllowed" Id="{7b2d080c-0000-4000-9000-00000000080c}">
+      <Declaration><![CDATA[METHOD PROTECTED M_SensorCheckAllowed : BOOL
+// Porownanie pamieci z czujnikami ma sens tylko wtedy, gdy to,
+// co lezy na transporterze, jest ladunkiem wezla.
+//
+// W trakcie desztaplowania tak nie jest: stos wisi na szczekach
+// albo wlasnie schodzi na transporter, a pamiec wezla mowi
+// "pusto". Bez tego wyjatku maszyna zglaszalaby nieistniejacy
+// blad przy kazdej palecie.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_SensorCheckAllowed := (nStep = ST3_IDLE) OR (nStep = ST3_WAIT_CLEAR);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d0809-0000-4000-9000-000000000809}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+// Reset NIE kasuje licznika palet w stosie - stos fizycznie
+// lezy na stacji i maszyna ma o nim pamietac. Do wyzerowania
+// stanu sluzy M_ServiceClearStack.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbLift.M_Reset();
+
+M_Reset := SUPER^.M_Reset();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ServiceClearStack" Id="{7b2d080a-0000-4000-9000-00000000080a}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ServiceClearStack : BOOL
+// Serwis zabral stos recznie i potwierdza, ze stacja jest pusta.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ServiceClearStack := FALSE;
+
+IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+pSt^.Mem.xStackArrived	:= FALSE;
+pSt^.Mem.nRemaining		:= 0;
+pSt^.Mem.xJawsLoaded	:= FALSE;
+xPersistDirty			:= TRUE;
+
+nStep := ST3_IDLE;
+
+M_ServiceClearStack := M_ServiceSetEmpty();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManLift" Id="{7b2d080b-0000-4000-9000-00000000080b}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ManLift
+VAR_INPUT
+	xUp			: BOOL;
+	xDown		: BOOL;
+	xJawClose	: BOOL;
+	xJawOpen	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbLift.M_ManJog(
+	xUp			:= xUp,
+	xDown		:= xDown,
+	xJawClose	:= xJawClose,
+	xJawOpen	:= xJawOpen
+);
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

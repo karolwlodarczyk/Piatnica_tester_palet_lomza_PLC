@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_CylState" Id="{7a1c0012-0000-4000-9000-000000000012}">
+    <Declaration><![CDATA[TYPE E_CylState :
+(
+	// Polozenie nieznane - po starcie, przed pierwsza komenda
+	// albo po powrocie z trybu recznego
+	CYL_UNKNOWN		:= 0,
+
+	CYL_RETRACTED	:= 10,
+	CYL_EXTENDING	:= 20,
+	CYL_EXTENDED	:= 30,
+	CYL_RETRACTING	:= 40,
+
+	CYL_MANUAL		:= 70,
+	CYL_ALARM		:= 90
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

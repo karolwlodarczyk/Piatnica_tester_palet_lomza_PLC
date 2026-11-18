@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="TestFb" Id="{7ffda057-922e-4c73-8527-4d253acdd599}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK TestFb
+VAR_INPUT
+	    stIn            : ST_NordSK550P_In;
+END_VAR
+VAR_OUTPUT
+	    wStatusWord      : UINT;
+		dupa2 : INT;
+END_VAR
+VAR
+	dupa : INT := 100;
+	i : INT;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[wStatusWord := stIn.wStatusWord;
+dupa := dupa2;
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

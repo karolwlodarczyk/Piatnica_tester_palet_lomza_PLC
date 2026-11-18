@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CylCfg" Id="{7a1c0014-0000-4000-9000-000000000014}">
+    <Declaration><![CDATA[TYPE ST_CylCfg :
+STRUCT
+	// =========================================================
+	// NASTAWY SILOWNIKA - ZMIENNE NIEULOTNE
+	// =========================================================
+	//
+	// Edytowalne przez operatora z HMI. Kod ich nie zapisuje -
+	// jedyny wyjatek to bazowanie przetwornika, ktore siedzi
+	// w ST_CylMem.
+
+	sName				: STRING(31);
+
+	eValve				: E_CylValve;
+	eFeedback			: E_CylFeedback;
+
+
+	// ---------------------------------------------------------
+	// CZASOWKI
+	// ---------------------------------------------------------
+
+	// Opoznienie wysterowania zaworu po otrzymaniu komendy.
+	// Sluzy do rozjezdzania w czasie silownikow, ktore nie
+	// moga ruszyc razem - np. gorne przed dolnymi na stacji 4.
+	tExtendDelay		: TIME := T#0MS;
+	tRetractDelay		: TIME := T#0MS;
+
+	// Czas, w ktorym ruch musi sie zakonczyc
+	tExtendWatchdog		: TIME := T#3S;
+	tRetractWatchdog	: TIME := T#3S;
+
+	// Watchdog wylaczalny osobno dla kazdego kierunku.
+	// Silownik bez krancowki na jednym koncu nie ma jak
+	// potwierdzic dojazdu - wtedy watchdog w tym kierunku
+	// musi byc wylaczony.
+	xExtendWdEnabled	: BOOL := TRUE;
+	xRetractWdEnabled	: BOOL := TRUE;
+
+
+	// ---------------------------------------------------------
+	// SPRZEZENIE OD POLOZENIA
+	// ---------------------------------------------------------
+	//
+	// Obserwacje polozenia koncowego mozna wylaczyc OSOBNO dla
+	// kazdego kierunku i zastapic czasowka. To jest tryb pracy
+	// z uszkodzonym czujnikiem: PLC uznaje ruch za wykonany po
+	// uplywie czasu.
+
+	xExtendFbEnabled	: BOOL := TRUE;
+	xRetractFbEnabled	: BOOL := TRUE;
+
+	tExtendSubst		: TIME := T#1S;
+	tRetractSubst		: TIME := T#1S;
+
+	// Czas stabilnego stanu potrzebny do uznania niezgodnosci
+	// krancowek za rzeczywista
+	tSettle				: TIME := T#500MS;
+
+
+	// ---------------------------------------------------------
+	// PROGI PRZETWORNIKA IO-LINK (tylko CYLFB_ANALOG)
+	// ---------------------------------------------------------
+	//
+	// Wszystkie progi liczone WZGLEDEM punktu bazowania.
+	// Znak dodatni zawsze w kierunku wysuwu - jesli przetwornik
+	// liczy odwrotnie, ustawic xInvertPos.
+	//
+	// Stacja 4 bazuje na silowniku WYSUNIETYM z paleta,
+	// stacja 5 na silowniku WYCOFANYM. Dlatego progi moga
+	// byc ujemne i nie jest to blad.
+
+	xInvertPos			: BOOL := FALSE;
+
+	// Ponizej tej wartosci uznajemy silownik za wycofany
+	diPosRetracted		: DINT := 100;
+
+	// Powyzej tej wartosci uznajemy silownik za wysuniety
+	diPosExtended		: DINT := 1000;
+
+	// Przekroczenie = deska pekla albo odpadla.
+	// To jest WYNIK TESTU, nie alarm silownika.
+	diPosLimit			: DINT := 2000;
+
+	// Powyzej tej wartosci zaczynamy liczyc czas trzymania
+	// nacisku (stacja 5)
+	diPosHoldStart		: DINT := 1500;
+	tHold				: TIME := T#2S;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

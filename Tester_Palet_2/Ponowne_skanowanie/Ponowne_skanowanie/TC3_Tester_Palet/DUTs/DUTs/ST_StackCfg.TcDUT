@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_StackCfg" Id="{7a1c0041-0000-4000-9000-000000000041}">
+    <Declaration><![CDATA[TYPE ST_StackCfg :
+STRUCT
+	// =========================================================
+	// DESZTAPLARKA / SZTAPLARKA - NASTAWY NIEULOTNE
+	// =========================================================
+	//
+	// Obie maszyny maja te sama kinematyke: wozek ze szczekami
+	// jezdzacy w pionie na falowniku, z enkoderem absolutnym,
+	// i trzy pozycje robocze. Rozni je tylko kolejnosc krokow.
+	//
+	// ---------------------------------------------------------
+	// TRZY POZYCJE
+	// ---------------------------------------------------------
+	// Liczac od dolu, przy stosie stojacym na transporterze:
+	//
+	//   diPosBottom  wysokosc desek PIERWSZEJ palety od dolu
+	//   diPosMiddle  wysokosc desek DRUGIEJ palety od dolu
+	//   diPosTop     pozycja stosu uniesionego
+	//
+	// Desztaplarka chwyta na diPosMiddle - czyli pod druga
+	// palete - i jedzie na diPosTop, przez co najnizsza paleta
+	// zostaje na transporterze. Odklada stos na diPosBottom.
+	//
+	// Sztaplarka odklada trzymany stos na diPosMiddle, czyli
+	// wprost na palete, ktora wlasnie przyjechala, a chwyta
+	// caly stos od spodu na diPosBottom.
+	//
+	// Wartosci wpisuje operator z palca. Automat bazujacy
+	// dopiszemy pozniej - dlatego jest kontrola poprawnosci:
+	// trzy pozycje musza tworzyc ciag rosnacy albo malejacy.
+
+	sName				: STRING(31);
+
+	// Wartosci dobrane na maszynie. Enkoder jednoobrotowy
+	// 0..65535, zero na pozycji DOLNEJ. Obie maszyny maja na
+	// razie te same punkty.
+	//
+	// UWAGA: to sa wartosci NIEULOTNE. Wpis z deklaracji
+	// obowiazuje tylko przy pierwszym pobraniu projektu albo
+	// po skasowaniu danych nieulotnych. Pozniejsza zmiana tej
+	// liczby w kodzie nie ruszy nastawy na sterowniku - trzeba
+	// ja poprawic online albo zrobic "Reset origin".
+	diPosBottom			: DINT := 0;
+	diPosMiddle			: DINT := 16000;
+	diPosTop			: DINT := 24000;
+
+	// Okno, w ktorym uznajemy pozycje za osiagnieta
+	diWindow			: DINT := 20;
+
+	// Odleglosc, od ktorej zwalniamy do predkosci dojazdowej
+	diSlowZone			: DINT := 300;
+
+	// TRUE = rosnaca wartosc enkodera odpowiada jezdzie
+	// napedem DO PRZODU
+	xIncreaseIsForward	: BOOL := TRUE;
+
+
+	// ---------------------------------------------------------
+	// PREDKOSCI I CZASY
+	// ---------------------------------------------------------
+
+	lrFreqFast			: LREAL := 35.0;
+	lrFreqSlow			: LREAL := 10.0;
+	lrFreqManual		: LREAL := 8.0;
+
+	// Czas, w ktorym wozek musi dojechac do pozycji
+	tMoveWatchdog		: TIME := T#15S;
+
+	// Uspokojenie po dojezdzie, zanim ruszymy szczekami
+	tSettle				: TIME := T#200MS;
+
+
+	// ---------------------------------------------------------
+	// STOS
+	// ---------------------------------------------------------
+	//
+	// Na razie stala liczba palet w stosie. Czujnik wykrywajacy,
+	// ze wszystkie palety zostaly wydane, dojdzie pozniej -
+	// wtedy ta wartosc bedzie tylko wartoscia oczekiwana.
+
+	nStackSize			: INT := 15;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

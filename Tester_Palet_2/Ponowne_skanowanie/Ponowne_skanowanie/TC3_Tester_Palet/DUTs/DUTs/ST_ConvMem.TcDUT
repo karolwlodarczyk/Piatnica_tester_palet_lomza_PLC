@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ConvMem" Id="{7a1c0006-0000-4000-9000-000000000006}">
+    <Declaration><![CDATA[TYPE ST_ConvMem :
+STRUCT
+	// =========================================================
+	// PAMIEC STANU TRANSPORTERA - ZMIENNE NIEULOTNE
+	// =========================================================
+	//
+	// To NIE sa nastawy. Ta struktura przezywa zanik zasilania
+	// i po starcie maszyna wie, gdzie stoja palety.
+	//
+	// UWAGA: kazda zmiana pola w tej strukturze musi ustawic
+	// xPersistDirty w wezle, zeby menedzer zapisal dane na
+	// dysk. Bez tego przy zaniku zasilania stracimy obraz.
+
+	// Obraz obecnosci ladunku. Ustawiany na TRUE w chwili
+	// ROZPOCZECIA wjazdu, kasowany dopiero po potwierdzonym
+	// zjezdzie - w trakcie przejazdu oba wezly sa "zajete",
+	// bo paleta fizycznie lezy na obu.
+	xLoadPresent		: BOOL;
+
+	// FALSE = pamiec rozjechala sie z czujnikami i operator
+	// musi rozstrzygnac stan. Wezel nie ruszy do tego czasu.
+	xStateVerified		: BOOL := TRUE;
+
+	// Przejazd zostal przerwany (STO, zanik zasilania,
+	// watchdog, zaciecie). Po resecie maszyna sprobuje
+	// dokonczyc ruch od tej fazy.
+	xTransferAborted	: BOOL;
+	eAbortedPhase		: E_NodeState;
+
+	// Licznik prob automatycznego wznowienia
+	nResumeCount		: INT;
+
+	// Operacja technologiczna dla lezacego ladunku zostala
+	// dokonczona. Bez tego po restarcie w polowie testu paleta
+	// wyjechalaby nieprzebadana i zaliczona jako dobra.
+	xOperationDone		: BOOL;
+
+	// Operacja zostala przerwana w polowie - grzyb, kurtyna,
+	// przeciazenie napedu, zanik zasilania. Na stacjach
+	// z Cfg.xNokOnInterrupt oznacza to odrzut palety.
+	xOperationInterrupted	: BOOL;
+
+	// Werdykt dla ladunku lezacego na wezle.
+	// TRUE = paleta odrzucona, nie realizujemy dla niej
+	// zadnych dalszych testow ani etykietowania.
+	xLoadNok			: BOOL;
+
+	// Numer sztuki - do sledzenia palety przez maszyne
+	nLoadId				: UDINT;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,681 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_CsvLogger" Id="{6c1a0002-0000-4000-9000-00000000c002}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_CsvLogger
+// =============================================================
+// OBSERWATOR STANU MASZYNY - ZAPIS CSV NA DYSK STEROWNIKA
+// =============================================================
+//
+// Blok NICZEGO nie zapisuje do zmiennych procesu. Tylko czyta
+// to, co mu poda MAIN, i odklada na dysk.
+//
+// -------------------------------------------------------------
+// JAK SIE TEGO UZYWA (ACT_Logger w MAIN)
+// -------------------------------------------------------------
+//
+//   fbLog.M_Begin();
+//   fbLog.M_Int ('nDeStep', nDeStep);
+//   fbLog.M_Bool('xPal_St03', xPal_St03);
+//   ...
+//   fbLog.M_End();
+//
+// Kazda metoda M_* dostaje NAZWE kolumny i WARTOSC. Gdy
+// xHeaderMode = TRUE, metoda dopisuje nazwe zamiast wartosci -
+// dzieki temu naglowek i wiersz powstaja z tego samego kodu
+// i nie moga sie rozjechac.
+//
+// -------------------------------------------------------------
+// PLIK
+// -------------------------------------------------------------
+//
+// Nazwa: <sDir><sPrefix>_RRRRMMDD_GGMMSS.csv, czas z zegara
+// sterownika (NT_GetTime). Nowy plik na zbocze xNewFile.
+//
+// Kazdy zrzut to OTWORZ (append) -> ZAPISZ -> ZAMKNIJ. Uchwyt
+// nie jest trzymany miedzy zrzutami, wiec:
+//   - plik mozna kopiowac w trakcie pracy,
+//   - stop PLC nie gubi ostatniego bufora,
+//   - katalog zaklada FB_CreateDir przy pierwszym starcie;
+//     jesli sie nie uda, nMkDirErrId to pokaze.
+//
+// Wiersze zbieraja sie w kolejce aOut i ida na dysk jednym
+// zapisem, nie czesciej niz co tFlushMin. Operacje na pliku sa
+// asynchroniczne (ADS) - cykl PLC na dysk nigdy nie czeka.
+//
+// Gdy kolejka jest pelna, wiersz przepada i rosnie
+// nLinesDropped. Lepiej zgubic wiersz niz cykl.
+VAR_INPUT
+
+	// Katalog z koncowym ukosnikiem. Zakladany automatycznie.
+	sDir			: STRING(200) := 'C:\TesterPalet\log\';
+
+	// Poczatek nazwy pliku
+	sPrefix			: STRING(31) := 'tp';
+
+	// Zbocze 0 -> 1 = zamknij biezacy plik, zaloz nowy
+	xNewFile		: BOOL;
+
+	// Najkrotszy odstep miedzy zrzutami na dysk
+	tFlushMin		: TIME := T#500MS;
+
+	// Limit czasu jednej operacji ADS na pliku
+	tTimeout		: TIME := T#3S;
+
+	// TRUE = metody M_* dopisuja NAZWE kolumny, nie wartosc
+	xHeaderMode		: BOOL;
+
+END_VAR
+VAR_OUTPUT
+
+	// Nazwa biezacego pliku - do odczytu online
+	sFileName		: STRING(255);
+
+	// TRUE = plik nazwany, ale naglowek jeszcze nie poszedl.
+	// MAIN na tym bicie wysyla wiersz naglowka.
+	xHeaderPending	: BOOL;
+
+	// Milisekundy od otwarcia pliku - kolumna t_ms
+	udiFileMs		: UDINT;
+
+	// Statystyka
+	nFileNo			: UDINT;
+	nLinesQueued	: UDINT;
+	nLinesDropped	: UDINT;
+	nBytesWritten	: UDINT;
+	nFlushes		: UDINT;
+	nErrors			: UDINT;
+	nLastErrId		: UDINT;
+	sLastErrWhere	: STRING(15);
+
+	// Podglad maszyny stanu bloku
+	nState			: INT;
+
+	// Wynik zakladania katalogu: 0 = OK albo juz istnial
+	nMkDirErrId		: UDINT;
+
+	// Bajty czekajace w kolejce
+	nOutLen			: UDINT;
+
+END_VAR
+VAR
+
+	xInit			: BOOL;
+	xRotateReq		: BOOL;
+	xFileNamed		: BOOL;
+	xFlushTick		: BOOL;
+
+	// Skladany wiersz
+	aLine			: ARRAY[0..cLineMax] OF BYTE;
+	nLineLen		: UDINT;
+	xLineOverflow	: BOOL;
+
+	// Kolejka wierszy czekajacych na zrzut
+	aOut			: ARRAY[0..cOutMax] OF BYTE;
+
+	// Bufor w trakcie zapisu - FB_FileWrite trzyma wskaznik,
+	// wiec kolejka nie moze sie pod nim zmieniac
+	aWr				: ARRAY[0..cOutMax] OF BYTE;
+	nWrLen			: UDINT;
+
+	fbOpen			: FB_FileOpen;
+	fbWrite			: FB_FileWrite;
+	fbClose			: FB_FileClose;
+	fbTime			: NT_GetTime;		// Tc2_Utilities
+	fbMkDir			: FB_CreateDir;		// Tc2_Utilities
+	hFile			: UINT;
+	xDirDone		: BOOL;
+	sDirNoSlash		: STRING(200);
+
+	rtrgNew			: R_TRIG;
+	tonFlush		: TON;
+
+	// Zegar: milisekundy doby w chwili otwarcia pliku
+	udiStartMsOfDay	: UDINT;
+	tFileStart		: TIME;
+
+	// Robocze
+	sTmp			: STRING(63);
+	nTmp			: DINT;
+
+END_VAR
+VAR CONSTANT
+
+	cLineMax		: UDINT := 8191;
+	cOutMax			: UDINT := 65535;
+	cCR				: BYTE := 13;
+	cLF				: BYTE := 10;
+	cSep			: BYTE := 59;		// ';'
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// ZBOCZE NOWEGO PLIKU
+// =============================================================
+
+rtrgNew(CLK := xNewFile);
+
+IF rtrgNew.Q OR NOT xInit THEN
+	xInit      := TRUE;
+	xRotateReq := TRUE;
+END_IF
+
+
+// Takt zrzutu - nie czesciej niz tFlushMin
+tonFlush(IN := TRUE, PT := tFlushMin);
+xFlushTick := tonFlush.Q;
+
+IF xFlushTick THEN
+	tonFlush(IN := FALSE);
+END_IF
+
+
+// Milisekundy od otwarcia pliku
+IF xFileNamed THEN
+	udiFileMs := TIME_TO_UDINT(TIME() - tFileStart);
+END_IF
+
+
+// =============================================================
+// MASZYNA STANU ZAPISU
+// =============================================================
+//
+//   0   spokoj: czekam na zrzut albo na nowy plik
+//   5   zakladam katalog (raz, przy pierwszym starcie)
+//  10   pobieram czas z zegara sterownika -> nazwa pliku
+//  20   otwieram plik (append)
+//  30   pisze bufor aWr
+//  40   zamykam plik
+
+CASE nState OF
+
+0:
+	IF xRotateReq AND NOT xDirDone THEN
+		// Katalog bez koncowego ukosnika
+		sDirNoSlash := sDir;
+		IF RIGHT(sDirNoSlash, 1) = '\' THEN
+			sDirNoSlash := LEFT(sDirNoSlash, LEN(sDirNoSlash) - 1);
+		END_IF
+		fbMkDir(bExecute := FALSE);
+		nState := 5;
+	ELSIF xRotateReq THEN
+		xRotateReq := FALSE;
+		fbTime(NETID := '', START := FALSE);
+		nState := 10;
+	ELSIF xFileNamed AND (nOutLen > 0) AND xFlushTick THEN
+		MEMCPY(destAddr := ADR(aWr), srcAddr := ADR(aOut), n := nOutLen);
+		nWrLen  := nOutLen;
+		nOutLen := 0;
+		fbOpen(bExecute := FALSE);
+		nState := 20;
+	END_IF
+
+5:
+	fbMkDir(
+		sNetId    := '',
+		sPathName := sDirNoSlash,
+		ePath     := PATH_GENERIC,
+		bExecute  := TRUE,
+		tTimeout  := tTimeout);
+
+	IF NOT fbMkDir.bBusy THEN
+		// Blad "juz istnieje" jest w porzadku - tylko do podgladu
+		nMkDirErrId := 0;
+		IF fbMkDir.bError THEN
+			nMkDirErrId := fbMkDir.nErrId;
+		END_IF
+		fbMkDir(bExecute := FALSE);
+		xDirDone := TRUE;
+		nState   := 0;
+	END_IF
+
+10:
+	fbTime(NETID := '', START := TRUE, TMOUT := tTimeout);
+
+	IF NOT fbTime.BUSY THEN
+
+		nFileNo := nFileNo + 1;
+
+		IF fbTime.ERR THEN
+			// Bez zegara tez logujemy - nazwa z licznika
+			sFileName := CONCAT(sDir, sPrefix);
+			sFileName := CONCAT(sFileName, '_noclock_');
+			sFileName := CONCAT(sFileName, UDINT_TO_STRING(nFileNo));
+			sFileName := CONCAT(sFileName, '.csv');
+			udiStartMsOfDay := 0;
+			nErrors    := nErrors + 1;
+			nLastErrId := fbTime.ERRID;
+			sLastErrWhere := 'NT_GetTime';
+		ELSE
+			sFileName := CONCAT(sDir, sPrefix);
+			sFileName := CONCAT(sFileName, '_');
+			sFileName := CONCAT(sFileName, WORD_TO_STRING(fbTime.TIMESTR.wYear));
+			sFileName := CONCAT(sFileName, M_Pad2(fbTime.TIMESTR.wMonth));
+			sFileName := CONCAT(sFileName, M_Pad2(fbTime.TIMESTR.wDay));
+			sFileName := CONCAT(sFileName, '_');
+			sFileName := CONCAT(sFileName, M_Pad2(fbTime.TIMESTR.wHour));
+			sFileName := CONCAT(sFileName, M_Pad2(fbTime.TIMESTR.wMinute));
+			sFileName := CONCAT(sFileName, M_Pad2(fbTime.TIMESTR.wSecond));
+			sFileName := CONCAT(sFileName, '.csv');
+			udiStartMsOfDay := WORD_TO_UDINT(fbTime.TIMESTR.wHour) * 3600000
+			                 + WORD_TO_UDINT(fbTime.TIMESTR.wMinute) * 60000
+			                 + WORD_TO_UDINT(fbTime.TIMESTR.wSecond) * 1000
+			                 + WORD_TO_UDINT(fbTime.TIMESTR.wMilliseconds);
+		END_IF
+
+		fbTime(NETID := '', START := FALSE);
+
+		tFileStart     := TIME();
+		udiFileMs      := 0;
+		xFileNamed     := TRUE;
+		xHeaderPending := TRUE;
+		nState         := 0;
+	END_IF
+
+20:
+	fbOpen(
+		sNetId    := '',
+		sPathName := sFileName,
+		nMode     := FOPEN_MODEAPPEND OR FOPEN_MODEBINARY,
+		ePath     := PATH_GENERIC,
+		bExecute  := TRUE,
+		tTimeout  := tTimeout);
+
+	IF NOT fbOpen.bBusy THEN
+		IF fbOpen.bError THEN
+			nErrors       := nErrors + 1;
+			nLastErrId    := fbOpen.nErrId;
+			sLastErrWhere := 'FB_FileOpen';
+			fbOpen(bExecute := FALSE);
+			nState := 0;
+		ELSE
+			hFile := fbOpen.hFile;
+			fbWrite(bExecute := FALSE);
+			nState := 30;
+		END_IF
+	END_IF
+
+30:
+	fbWrite(
+		sNetId     := '',
+		hFile      := hFile,
+		pWriteBuff := ADR(aWr),
+		cbWriteLen := nWrLen,
+		bExecute   := TRUE,
+		tTimeout   := tTimeout);
+
+	IF NOT fbWrite.bBusy THEN
+		IF fbWrite.bError THEN
+			nErrors       := nErrors + 1;
+			nLastErrId    := fbWrite.nErrId;
+			sLastErrWhere := 'FB_FileWrite';
+		ELSE
+			nBytesWritten := nBytesWritten + fbWrite.cbWrite;
+			nFlushes      := nFlushes + 1;
+		END_IF
+		fbWrite(bExecute := FALSE);
+		fbClose(bExecute := FALSE);
+		nState := 40;
+	END_IF
+
+40:
+	fbClose(
+		sNetId   := '',
+		hFile    := hFile,
+		bExecute := TRUE,
+		tTimeout := tTimeout);
+
+	IF NOT fbClose.bBusy THEN
+		IF fbClose.bError THEN
+			nErrors       := nErrors + 1;
+			nLastErrId    := fbClose.nErrId;
+			sLastErrWhere := 'FB_FileClose';
+		END_IF
+		fbClose(bExecute := FALSE);
+		fbOpen(bExecute := FALSE);
+		nState := 0;
+	END_IF
+
+ELSE
+	nState := 0;
+
+END_CASE
+]]></ST>
+    </Implementation>
+    <Method Name="M_Begin" Id="{6c1a0002-0000-4000-9000-00000000c101}">
+      <Declaration><![CDATA[// Poczatek wiersza - czysci bufor skladania
+METHOD M_Begin
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nLineLen      := 0;
+xLineOverflow := FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_End" Id="{6c1a0002-0000-4000-9000-00000000c102}">
+      <Declaration><![CDATA[// Koniec wiersza - CRLF i do kolejki.
+// Naglowek (xHeaderMode) idzie na POCZATEK kolejki, zeby byl
+// pierwsza linia pliku nawet wtedy, gdy wiersze zdazyly sie
+// juz ustawic w kolejce przed nadaniem nazwy.
+METHOD M_End
+VAR
+	nNeed	: UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nLineLen = 0 THEN
+	RETURN;
+END_IF
+
+// Ostatni srednik zamieniamy na koniec linii
+IF aLine[nLineLen - 1] = cSep THEN
+	nLineLen := nLineLen - 1;
+END_IF
+
+IF nLineLen + 2 > cLineMax THEN
+	xLineOverflow := TRUE;
+END_IF
+
+IF xLineOverflow THEN
+	nLinesDropped := nLinesDropped + 1;
+	nLineLen := 0;
+	RETURN;
+END_IF
+
+aLine[nLineLen]     := cCR;
+aLine[nLineLen + 1] := cLF;
+nNeed := nLineLen + 2;
+
+IF nOutLen + nNeed > cOutMax THEN
+	nLinesDropped := nLinesDropped + 1;
+	nLineLen := 0;
+	RETURN;
+END_IF
+
+IF xHeaderMode THEN
+	IF nOutLen > 0 THEN
+		MEMMOVE(destAddr := ADR(aOut[nNeed]), srcAddr := ADR(aOut), n := nOutLen);
+	END_IF
+	MEMCPY(destAddr := ADR(aOut), srcAddr := ADR(aLine), n := nNeed);
+	xHeaderPending := FALSE;
+ELSE
+	MEMCPY(destAddr := ADR(aOut[nOutLen]), srcAddr := ADR(aLine), n := nNeed);
+END_IF
+
+nOutLen      := nOutLen + nNeed;
+nLinesQueued := nLinesQueued + 1;
+nLineLen     := 0;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Raw" Id="{6c1a0002-0000-4000-9000-00000000c103}">
+      <Declaration><![CDATA[// Dopisz tekst do wiersza BEZ separatora. Sredniki w tresci
+// zamienia na przecinki, zeby nie rozbily kolumn.
+METHOD M_Raw
+VAR_INPUT
+	sText	: STRING(255);
+END_VAR
+VAR
+	nLen	: UDINT;
+	i		: UDINT;
+	pByte	: POINTER TO BYTE;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nLen := INT_TO_UDINT(LEN(sText));
+
+IF nLen = 0 THEN
+	RETURN;
+END_IF
+
+IF nLineLen + nLen > cLineMax THEN
+	xLineOverflow := TRUE;
+	RETURN;
+END_IF
+
+MEMCPY(destAddr := ADR(aLine[nLineLen]), srcAddr := ADR(sText), n := nLen);
+
+pByte := ADR(aLine[nLineLen]);
+
+FOR i := 0 TO nLen - 1 DO
+	IF pByte^ = cSep THEN
+		pByte^ := 44;	// ','
+	END_IF
+	IF pByte^ < 32 THEN
+		pByte^ := 32;	// znaki sterujace -> spacja
+	END_IF
+	pByte := pByte + 1;
+END_FOR
+
+nLineLen := nLineLen + nLen;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Sep" Id="{6c1a0002-0000-4000-9000-00000000c104}">
+      <Declaration><![CDATA[// Separator kolumn
+METHOD M_Sep
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nLineLen + 1 > cLineMax THEN
+	xLineOverflow := TRUE;
+	RETURN;
+END_IF
+
+aLine[nLineLen] := cSep;
+nLineLen := nLineLen + 1;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Str" Id="{6c1a0002-0000-4000-9000-00000000c105}">
+      <Declaration><![CDATA[// Kolumna tekstowa
+METHOD M_Str
+VAR_INPUT
+	sName	: STRING(63);
+	sVal	: STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xHeaderMode THEN
+	M_Raw(sName);
+ELSE
+	M_Raw(sVal);
+END_IF
+
+M_Sep();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Int" Id="{6c1a0002-0000-4000-9000-00000000c106}">
+      <Declaration><![CDATA[// Kolumna calkowita (INT, DINT, UDINT po konwersji)
+METHOD M_Int
+VAR_INPUT
+	sName	: STRING(63);
+	diVal	: DINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xHeaderMode THEN
+	M_Raw(sName);
+ELSE
+	M_Raw(DINT_TO_STRING(diVal));
+END_IF
+
+M_Sep();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_UInt" Id="{6c1a0002-0000-4000-9000-00000000c107}">
+      <Declaration><![CDATA[// Kolumna calkowita bez znaku (UDINT - liczniki)
+METHOD M_UInt
+VAR_INPUT
+	sName	: STRING(63);
+	udiVal	: UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xHeaderMode THEN
+	M_Raw(sName);
+ELSE
+	M_Raw(UDINT_TO_STRING(udiVal));
+END_IF
+
+M_Sep();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Bool" Id="{6c1a0002-0000-4000-9000-00000000c108}">
+      <Declaration><![CDATA[// Kolumna logiczna: 1 / 0
+METHOD M_Bool
+VAR_INPUT
+	sName	: STRING(63);
+	xVal	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xHeaderMode THEN
+	M_Raw(sName);
+ELSIF xVal THEN
+	M_Raw('1');
+ELSE
+	M_Raw('0');
+END_IF
+
+M_Sep();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Hex" Id="{6c1a0002-0000-4000-9000-00000000c109}">
+      <Declaration><![CDATA[// Kolumna szesnastkowa 16-bit, np. 0637 (slowa stanu falownikow)
+METHOD M_Hex
+VAR_INPUT
+	sName	: STRING(63);
+	wVal	: WORD;
+END_VAR
+VAR
+	aHex	: ARRAY[0..4] OF BYTE;
+	sHex	: STRING(4);
+	i		: INT;
+	nNib	: BYTE;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xHeaderMode THEN
+	M_Raw(sName);
+ELSE
+	FOR i := 0 TO 3 DO
+		nNib := WORD_TO_BYTE(SHR(wVal, 12 - 4 * i) AND 16#000F);
+		IF nNib < 10 THEN
+			aHex[i] := 48 + nNib;		// '0'..'9'
+		ELSE
+			aHex[i] := 55 + nNib;		// 'A'..'F'
+		END_IF
+	END_FOR
+	aHex[4] := 0;
+	MEMCPY(destAddr := ADR(sHex), srcAddr := ADR(aHex), n := 5);
+	M_Raw(sHex);
+END_IF
+
+M_Sep();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Real" Id="{6c1a0002-0000-4000-9000-00000000c10a}">
+      <Declaration><![CDATA[// Kolumna zmiennoprzecinkowa z JEDNYM miejscem po kropce.
+// LREAL_TO_STRING daje kilkanascie cyfr - nieczytelne w CSV.
+METHOD M_Real
+VAR_INPUT
+	sName	: STRING(63);
+	lrVal	: LREAL;
+END_VAR
+VAR
+	diScaled	: DINT;
+	diAbs		: DINT;
+	sOut		: STRING(31);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xHeaderMode THEN
+	M_Raw(sName);
+ELSE
+	diScaled := LREAL_TO_DINT(lrVal * 10.0);
+	diAbs    := ABS(diScaled);
+	sOut := DINT_TO_STRING(diAbs / 10);
+	sOut := CONCAT(sOut, '.');
+	sOut := CONCAT(sOut, DINT_TO_STRING(diAbs MOD 10));
+	IF diScaled < 0 THEN
+		sOut := CONCAT('-', sOut);
+	END_IF
+	M_Raw(sOut);
+END_IF
+
+M_Sep();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Clock" Id="{6c1a0002-0000-4000-9000-00000000c10b}">
+      <Declaration><![CDATA[// Kolumna zegara GG:MM:SS.mmm - czas otwarcia pliku plus
+// milisekundy od otwarcia. Nie pyta zegara co cykl.
+METHOD M_Clock
+VAR_INPUT
+	sName	: STRING(63);
+END_VAR
+VAR
+	udiMs	: UDINT;
+	sOut	: STRING(15);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF xHeaderMode THEN
+	M_Raw(sName);
+ELSE
+	udiMs := (udiStartMsOfDay + udiFileMs) MOD 86400000;
+	sOut := M_Pad2(UDINT_TO_WORD(udiMs / 3600000));
+	sOut := CONCAT(sOut, ':');
+	sOut := CONCAT(sOut, M_Pad2(UDINT_TO_WORD((udiMs / 60000) MOD 60)));
+	sOut := CONCAT(sOut, ':');
+	sOut := CONCAT(sOut, M_Pad2(UDINT_TO_WORD((udiMs / 1000) MOD 60)));
+	sOut := CONCAT(sOut, '.');
+	sOut := CONCAT(sOut, M_Pad3(UDINT_TO_WORD(udiMs MOD 1000)));
+	M_Raw(sOut);
+END_IF
+
+M_Sep();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Pad2" Id="{6c1a0002-0000-4000-9000-00000000c10c}">
+      <Declaration><![CDATA[// Liczba 0..99 jako dwa znaki z zerem wiodacym
+METHOD M_Pad2 : STRING(7)
+VAR_INPUT
+	wVal	: WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF wVal < 10 THEN
+	M_Pad2 := CONCAT('0', WORD_TO_STRING(wVal));
+ELSE
+	M_Pad2 := WORD_TO_STRING(wVal);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_Pad3" Id="{6c1a0002-0000-4000-9000-00000000c10d}">
+      <Declaration><![CDATA[// Liczba 0..999 jako trzy znaki z zerami wiodacymi
+METHOD M_Pad3 : STRING(7)
+VAR_INPUT
+	wVal	: WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF wVal < 10 THEN
+	M_Pad3 := CONCAT('00', WORD_TO_STRING(wVal));
+ELSIF wVal < 100 THEN
+	M_Pad3 := CONCAT('0', WORD_TO_STRING(wVal));
+ELSE
+	M_Pad3 := WORD_TO_STRING(wVal);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

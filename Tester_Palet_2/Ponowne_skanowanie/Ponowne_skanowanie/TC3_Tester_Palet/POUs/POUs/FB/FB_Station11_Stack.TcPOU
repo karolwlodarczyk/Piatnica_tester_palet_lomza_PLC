@@ -1,0 +1,467 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_Station11_Stack" Id="{7b2d0900-0000-4000-9000-000000000900}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Station11_Stack EXTENDS FB_RollerConveyor
+// =============================================================
+// STACJA 11 - SZTAPLARKA
+// =============================================================
+//
+// Ta sama kinematyka co desztaplarka, sekwencja odwrocona.
+// Wozek trzyma rosnacy stos w gorze, a kazda nowa paleta
+// wjezdza pod niego.
+//
+// -------------------------------------------------------------
+// CYKL
+// -------------------------------------------------------------
+//   czekanie      wozek na GORZE, szczeki zamkniete na stosie
+//   wjazd palety  paleta zatrzymuje sie na czujnikach
+//   odlozenie     wozek na SRODEK - stos siada na nowa palete
+//   otwarcie      szczeki puszczaja stos
+//   zejscie       wozek na DOL, pod najnizsza palete
+//   chwyt         szczeki zamykaja sie na calym stosie
+//   uniesienie    wozek na GORE, stos wyzszy o jedna palete
+//   i od nowa, az uzbiera sie Cfg.nStackSize sztuk
+//
+// -------------------------------------------------------------
+// KOLIZJA
+// -------------------------------------------------------------
+// Paleta nie ma prawa wjechac, dopoki wozek nie stoi na GORZE
+// z zamknietymi szczekami. Inaczej wjechalaby wprost w stos
+// albo w szczeki - dlatego jest to warunek przyjecia ladunku,
+// a nie tylko krok sekwencji.
+VAR_INPUT
+
+	diLiftPosRaw	: DINT;
+	xJawClosedSw	: BOOL;
+	xJawOpenSw		: BOOL;
+
+END_VAR
+VAR_OUTPUT
+
+	xJawCoilClose	: BOOL;
+	xJawCoilOpen	: BOOL;
+
+	nStep			: INT;
+
+	// Ile palet wisi na szczekach
+	nHeld			: INT;
+
+	diLiftPos		: DINT;
+	nLiftTarget		: INT;
+	xLiftInPos		: BOOL;
+
+	eLiftAlarm		: E_StackAlarm;
+
+END_VAR
+VAR
+
+	pSt		: POINTER TO ST_StackPersist;
+	fbLift	: FB_StackLift;
+
+	nStackId	: UDINT;
+
+END_VAR
+VAR CONSTANT
+
+	ST11_IDLE		: INT := 0;
+	ST11_SETDOWN	: INT := 10;
+	ST11_OPEN		: INT := 20;
+	ST11_GODOWN		: INT := 30;
+	ST11_GRIP		: INT := 40;
+	ST11_LIFT		: INT := 50;
+	ST11_AFTER		: INT := 60;
+	ST11_DELIVER	: INT := 70;
+	ST11_RELEASE	: INT := 80;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL STACJI 11
+// =============================================================
+
+
+M_CallLift();
+
+SUPER^();
+
+M_StackCycle();
+
+M_MapStatus();
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_ConfigStation" Id="{7b2d0901-0000-4000-9000-000000000901}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ConfigStation
+// Wolac raz, przy starcie, PO M_Config klasy bazowej.
+VAR_INPUT
+	pStPersist	: POINTER TO ST_StackPersist;
+
+	// Falownik krzywki sztaplarki
+	pLiftDrive	: POINTER TO FB_NordSK550PP;
+
+	nJawId		: INT;
+	pJawPersist	: POINTER TO ST_CylPersist;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pSt := pStPersist;
+
+fbLift.M_Config(
+	pPersist	:= pStPersist,
+	pDrv		:= pLiftDrive,
+	nJawId		:= nJawId,
+	pJawPersist	:= pJawPersist
+);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CallLift" Id="{7b2d0902-0000-4000-9000-000000000902}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CallLift
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbLift(
+	eMode			:= eMode,
+	xSafetyOK		:= xSafetyOK,
+	diPosRaw		:= diLiftPosRaw,
+	xJawClosedSw	:= xJawClosedSw,
+	xJawOpenSw		:= xJawOpenSw
+);
+
+xJawCoilClose	:= fbLift.xJawCoilClose;
+xJawCoilOpen	:= fbLift.xJawCoilOpen;
+
+IF fbLift.xAlarm THEN
+	M_RaiseAlarm(eNew := ALM_OPERATION_FAILED);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MapStatus" Id="{7b2d0903-0000-4000-9000-000000000903}">
+      <Declaration><![CDATA[METHOD PROTECTED M_MapStatus
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[diLiftPos	:= fbLift.diPos;
+nLiftTarget	:= fbLift.nTargetSel;
+xLiftInPos	:= fbLift.xInPosition;
+eLiftAlarm	:= fbLift.eAlarm;
+
+IF pSt <> 0 THEN
+	nHeld := pSt^.Mem.nHeld;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_WhyCannotAccept" Id="{7b2d0904-0000-4000-9000-000000000904}">
+      <Declaration><![CDATA[METHOD PUBLIC M_WhyCannotAccept : E_WaitCause
+// Warunki klasy bazowej plus zabezpieczenie przed kolizja:
+// wozek musi stac na GORZE, a jesli cos trzyma - ze
+// szczekami zamknietymi.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_WhyCannotAccept := SUPER^.M_WhyCannotAccept();
+
+IF M_WhyCannotAccept <> WAIT_NONE THEN
+	RETURN;
+END_IF
+
+IF pSt = 0 THEN
+	M_WhyCannotAccept := WAIT_NOT_CONFIGURED;
+	RETURN;
+END_IF
+
+// Stacja wylaczona - sam przelot, bez warunkow mechaniki
+IF NOT pP^.Cfg.xStationEnabled THEN
+	RETURN;
+END_IF
+
+IF (fbLift.nTargetSel <> 3) OR NOT fbLift.xInPosition THEN
+	M_WhyCannotAccept := WAIT_STATION_NOT_READY;
+	RETURN;
+END_IF
+
+IF (pSt^.Mem.nHeld > 0) AND NOT fbLift.xJawsClosed THEN
+	M_WhyCannotAccept := WAIT_STATION_NOT_READY;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationRequired" Id="{7b2d0905-0000-4000-9000-000000000905}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationRequired : BOOL
+// Kazda paleta musi sie zatrzymac i trafic na stos. Gotowy stos
+// wydany przez M_InjectLoad ma juz xOperationDone.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationRequired := TRUE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF NOT pP^.Cfg.xStationEnabled THEN
+	M_OperationRequired := FALSE;
+	RETURN;
+END_IF
+
+M_OperationRequired := NOT pP^.Mem.xOperationDone;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationCycle" Id="{7b2d0906-0000-4000-9000-000000000906}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationCycle : BOOL
+// Wlasciwa sekwencja siedzi w M_StackCycle - musi dzialac takze
+// wtedy, gdy wezel jest pusty, bo wozek konczy wtedy ruch w gore.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationCycle := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+M_OperationCycle := pP^.Mem.xOperationDone;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_SensorCheckAllowed" Id="{7b2d0907-0000-4000-9000-000000000907}">
+      <Declaration><![CDATA[METHOD PROTECTED M_SensorCheckAllowed : BOOL
+// W trakcie sztaplowania to, co lezy na transporterze, nie jest
+// ladunkiem wezla: paleta wjezdza pod stos, potem znika w gore,
+// a gotowy stos schodzi na transporter zanim pamiec o nim wie.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_SensorCheckAllowed := (nStep = ST11_IDLE);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_StackCycle" Id="{7b2d0908-0000-4000-9000-000000000908}">
+      <Declaration><![CDATA[METHOD PROTECTED M_StackCycle
+// Sekwencja sztaplowania.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+IF NOT xSafetyOK THEN
+	RETURN;
+END_IF
+
+IF xAlarm THEN
+	RETURN;
+END_IF
+
+IF eMode <> MODE_AUTO THEN
+	RETURN;
+END_IF
+
+// Stacja wylaczona przez operatora - paleta przejezdza dalej
+// bez sztaplowania. Uzywane przy uruchomieniu transportu.
+IF NOT pP^.Cfg.xStationEnabled THEN
+	nStep := ST11_IDLE;
+	RETURN;
+END_IF
+
+
+CASE nStep OF
+
+ST11_IDLE:
+	// Bez palety wozek czeka na gorze - to jest warunek wjazdu
+	IF NOT pP^.Mem.xLoadPresent THEN
+		M_HoldTop();
+		RETURN;
+	END_IF
+
+	// Gotowy stos czeka na wydanie - nie ruszamy mechanika
+	IF pP^.Mem.xOperationDone THEN
+		RETURN;
+	END_IF
+
+	IF eState <> NODE_BUSY THEN
+		RETURN;
+	END_IF
+
+	IF pSt^.Mem.nHeld > 0 THEN
+		nStep := ST11_SETDOWN;
+		RETURN;
+	END_IF
+
+	// Pierwsza paleta stosu - nie ma czego odkladac
+	nStep := ST11_GODOWN;
+
+
+ST11_SETDOWN:
+	// Trzymany stos siada na palete, ktora wlasnie przyjechala
+	IF fbLift.M_MoveTo(nSel := 2) THEN
+		nStep := ST11_OPEN;
+	END_IF
+
+
+ST11_OPEN:
+	IF fbLift.M_JawsOpen() THEN
+		pSt^.Mem.xJawsLoaded	:= FALSE;
+		xPersistDirty			:= TRUE;
+		nStep					:= ST11_GODOWN;
+	END_IF
+
+
+ST11_GODOWN:
+	// Wozek pod najnizsza palete calego stosu
+	fbLift.M_JawsOpen();
+
+	IF NOT fbLift.xJawsOpen THEN
+		RETURN;
+	END_IF
+
+	IF fbLift.M_MoveTo(nSel := 1) THEN
+		nStep := ST11_GRIP;
+	END_IF
+
+
+ST11_GRIP:
+	IF fbLift.M_JawsClose() THEN
+		pSt^.Mem.xJawsLoaded	:= TRUE;
+		xPersistDirty			:= TRUE;
+		nStep					:= ST11_LIFT;
+	END_IF
+
+
+ST11_LIFT:
+	// Caly stos idzie w gore, transporter zostaje wolny
+	IF NOT fbLift.M_MoveTo(nSel := 3) THEN
+		RETURN;
+	END_IF
+
+	pSt^.Mem.nHeld	:= pSt^.Mem.nHeld + 1;
+	xPersistDirty	:= TRUE;
+
+	nStackId := pP^.Mem.nLoadId;
+	nStep := ST11_AFTER;
+
+
+ST11_AFTER:
+	// Paleta opuscila transporter inna droga niz przejazdem
+	M_ClearLoad();
+
+	IF pSt^.Mem.nHeld >= pSt^.Cfg.nStackSize THEN
+		nStep := ST11_DELIVER;
+		RETURN;
+	END_IF
+
+	nStep := ST11_IDLE;
+
+
+ST11_DELIVER:
+	// Komplet - odstawiamy stos na transporter
+	IF fbLift.M_MoveTo(nSel := 1) THEN
+		nStep := ST11_RELEASE;
+	END_IF
+
+
+ST11_RELEASE:
+	IF NOT fbLift.M_JawsOpen() THEN
+		RETURN;
+	END_IF
+
+	pSt^.Mem.nHeld			:= 0;
+	pSt^.Mem.xJawsLoaded	:= FALSE;
+	xPersistDirty			:= TRUE;
+
+	// Stos staje sie ladunkiem wezla i jedzie na stacje 12
+	M_InjectLoad(xNok := FALSE, nLoadId := nStackId, xOpDone := TRUE);
+
+	nStep := ST11_IDLE;
+
+
+ELSE
+	nStep := ST11_IDLE;
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_HoldTop" Id="{7b2d0909-0000-4000-9000-000000000909}">
+      <Declaration><![CDATA[METHOD PROTECTED M_HoldTop
+// Stan spoczynkowy: wozek na gorze, szczeki zamkniete jesli
+// cos trzymaja. Dopiero wtedy wolno wpuscic palete.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF pSt^.Mem.nHeld > 0 THEN
+	fbLift.M_JawsClose();
+END_IF
+
+fbLift.M_MoveTo(nSel := 3);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d090a-0000-4000-9000-00000000090a}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+// Reset NIE kasuje licznika palet na szczekach - stos fizycznie
+// wisi na maszynie. Do wyzerowania sluzy M_ServiceClearStack.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbLift.M_Reset();
+
+M_Reset := SUPER^.M_Reset();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ServiceClearStack" Id="{7b2d090b-0000-4000-9000-00000000090b}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ServiceClearStack : BOOL
+// Serwis zdjal stos recznie i potwierdza, ze szczeki sa puste.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ServiceClearStack := FALSE;
+
+IF pSt = 0 THEN
+	RETURN;
+END_IF
+
+pSt^.Mem.nHeld			:= 0;
+pSt^.Mem.xJawsLoaded	:= FALSE;
+pSt^.Mem.xStackArrived	:= FALSE;
+xPersistDirty			:= TRUE;
+
+nStep := ST11_IDLE;
+
+M_ServiceClearStack := M_ServiceSetEmpty();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManLift" Id="{7b2d090c-0000-4000-9000-00000000090c}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ManLift
+VAR_INPUT
+	xUp			: BOOL;
+	xDown		: BOOL;
+	xJawClose	: BOOL;
+	xJawOpen	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbLift.M_ManJog(
+	xUp			:= xUp,
+	xDown		:= xDown,
+	xJawClose	:= xJawClose,
+	xJawOpen	:= xJawOpen
+);
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

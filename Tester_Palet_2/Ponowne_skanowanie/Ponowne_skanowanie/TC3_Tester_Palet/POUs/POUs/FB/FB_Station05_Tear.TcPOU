@@ -1,0 +1,811 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_Station05_Tear" Id="{7b2d0500-0000-4000-9000-000000000500}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Station05_Tear EXTENDS FB_RollerConveyor
+// =============================================================
+// STACJA 5 - TEST WYTRZYMALOSCI NA ROZRYWANIE
+// =============================================================
+//
+// Transporter rolkowy plus mechanika testu: blokada punktu
+// zatrzymania, podnoszone szczeki chwytajace dolne deski
+// i szesc silownikow rozrywajacych napierajacych na deski gorne.
+//
+// -------------------------------------------------------------
+// DLACZEGO NIE MA PRZEJAZDU BEZ ZATRZYMANIA
+// -------------------------------------------------------------
+// Blokada stoi dokladnie w punkcie zatrzymania. Zeby przepuscic
+// palete bez postoju, trzeba by ja opuscic ZANIM paleta dojedzie,
+// czyli podjac decyzje na podstawie stanu, ktory dopiero ma
+// nastapic. Blad w tej decyzji to paleta wjezdzajaca w podniesiona
+// blokade z pelna predkoscia.
+//
+// Dlatego stacja 5 zatrzymuje KAZDA palete, takze odrzucona
+// i takze przy wylaczonym tescie - wtedy sekwencja sprowadza sie
+// do opuszczenia blokady. W GVL_PERSIST.aConv[5].Cfg nalezy
+// ustawic xAllowPassThrough := FALSE.
+//
+// -------------------------------------------------------------
+// KIEDY PODNOSI SIE BLOKADA
+// -------------------------------------------------------------
+// W chwili, gdy z poprzedniej stacji RUSZA paleta - czyli
+// w M_BeginInfeed. Wtedy droga jest wolna na pewno, a czasu na
+// ruch jest tyle, ile trwa przejazd miedzy stacjami.
+//
+// Podnoszenie jej czasowka po zjezdzie poprzedniej palety
+// byloby zgadywaniem, czy paleta zeszla juz z blokady.
+//
+// -------------------------------------------------------------
+// PRZEBIEG TESTU
+// -------------------------------------------------------------
+//   10  czasowka od potwierdzenia palety na blokadzie
+//   20  podniesienie szczek
+//   30  zamkniecie szczek (3 pary)
+//   40  czasowka przed rozrywaniem
+//   50  rozrywanie - kazdy silownik badany OSOBNO
+//   60  otwarcie szczek
+//   70  opuszczenie szczek
+//   80  opuszczenie blokady
+//   90  koniec
+//
+// Kazdy silownik rozrywajacy ma wlasny licznik czasu trzymania
+// nacisku, bo wszystkie ida z inna predkoscia. Przekroczenie
+// progu polozenia = deska odpadla: paleta staje sie NOK i nie
+// przechodzi juz zadnych dalszych testow ani etykietowania.
+VAR_INPUT
+
+	stIn	: ST_St05_In;
+
+END_VAR
+VAR_OUTPUT
+
+	stOut	: ST_St05_Out;
+
+	// Krok sekwencji testu - do podgladu na HMI
+	nTestStep		: INT;
+
+	// Ktorego silownika rozrywajacego jeszcze czekamy (0 = zaden)
+	nWaitPull		: INT;
+
+	// Wynik dla biezacej palety
+	axBoardBroken	: ARRAY[1..6] OF BOOL;
+
+	// Wolna droga dla wjazdu: szczeki otwarte i opuszczone,
+	// silowniki rozrywajace wycofane. Blokada NIE jest tu
+	// warunkiem - podnosi sie dopiero w chwili wjazdu.
+	xEntryReady		: BOOL;
+
+	// Pelne polozenie spoczynkowe, z blokada w gorze
+	xHomePosition	: BOOL;
+
+	// Pierwszy silownik zglaszajacy blad i jego przyczyna.
+	// nFaultyCyl: 1..3 szczeki, 4 blokada, 5 podnoszenie szczek,
+	//             6..11 silowniki rozrywajace 1..6
+	nFaultyCyl		: INT;
+	eCylAlarm		: E_CylAlarm;
+
+END_VAR
+VAR
+
+	pSt				: POINTER TO ST_St05Cfg;
+
+	// Blokada punktu zatrzymania
+	fbBlock			: FB_Cylinder;
+
+	// Podnoszenie i opuszczanie szczek
+	fbJawLift		: FB_Cylinder;
+
+	// Szczeki - trzy pary, kazda para jeden zawor
+	fbJaw			: ARRAY[1..3] OF FB_Cylinder;
+
+	// Silowniki rozrywajace, indeksowane NUMEREM SILOWNIKA
+	fbPull			: ARRAY[1..6] OF FB_Cylinder;
+
+	axPullDone		: ARRAY[1..6] OF BOOL;
+
+	tonSeq			: TON;
+	tonOpWd			: TON;
+
+	i				: INT;
+	xAllJawsOpen	: BOOL;
+	xAllJawsClosed	: BOOL;
+	xAllPullBack	: BOOL;
+
+END_VAR
+VAR CONSTANT
+
+	ST5_IDLE			: INT := 0;
+	ST5_DELAY			: INT := 10;
+	ST5_JAWLIFT_UP		: INT := 20;
+	ST5_JAWS_CLOSE		: INT := 30;
+	ST5_SETTLE			: INT := 40;
+	ST5_PULL			: INT := 50;
+	ST5_JAWS_OPEN		: INT := 60;
+	ST5_JAWLIFT_DOWN	: INT := 70;
+	ST5_BLOCK_DOWN		: INT := 80;
+	ST5_DONE			: INT := 90;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// CYKL STACJI 5
+// =============================================================
+
+
+// 1. Odswiezenie sprzezen silownikow.
+//    Robimy to PRZED sekwencja, zeby decyzja "deska odpadla"
+//    zapadala na swiezym odczycie przetwornika.
+M_CallCylinders();
+
+
+// 2. Warstwa transportu - wola M_OperationRequired
+//    i M_OperationCycle
+SUPER^();
+
+
+// 3. Sprowadzenie mechaniki do polozenia spoczynkowego,
+//    gdy stacja jest pusta
+M_HomeCycle();
+
+
+// 4. Przepisanie cewek na strukture wyjsciowa
+M_MapOutputs();
+]]></ST>
+    </Implementation>
+
+    <Method Name="M_ConfigStation" Id="{7b2d0501-0000-4000-9000-000000000501}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ConfigStation
+// Podpiecie nastaw stacji i wszystkich silownikow.
+// Wolac raz, przy starcie, PO M_Config klasy bazowej.
+VAR_INPUT
+	pStCfg		: POINTER TO ST_St05Cfg;
+
+	// Tablica rekordow silownikow - ADR(GVL_PERSIST.aCyl)
+	pCylArray	: POINTER TO ARRAY[1..32] OF ST_CylPersist;
+
+	// Pierwszy indeks przydzielony stacji. Stacja zajmuje
+	// 11 kolejnych rekordow: szczeki 1..3, blokada,
+	// podnoszenie szczek, silowniki rozrywajace 1..6.
+	nCylBase	: INT;
+END_VAR
+VAR
+	j			: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[pSt := pStCfg;
+
+IF pCylArray = 0 THEN
+	RETURN;
+END_IF
+
+
+// Szczeki
+FOR j := 1 TO 3 DO
+	fbJaw[j].M_Config(
+		nId			:= nCylBase + j - 1,
+		pPersist	:= ADR(pCylArray^[nCylBase + j - 1])
+	);
+END_FOR
+
+// Blokada punktu zatrzymania
+fbBlock.M_Config(
+	nId			:= nCylBase + 3,
+	pPersist	:= ADR(pCylArray^[nCylBase + 3])
+);
+
+// Podnoszenie szczek
+fbJawLift.M_Config(
+	nId			:= nCylBase + 4,
+	pPersist	:= ADR(pCylArray^[nCylBase + 4])
+);
+
+// Silowniki rozrywajace
+FOR j := 1 TO 6 DO
+	fbPull[j].M_Config(
+		nId			:= nCylBase + 4 + j,
+		pPersist	:= ADR(pCylArray^[nCylBase + 4 + j])
+	);
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_CallCylinders" Id="{7b2d0502-0000-4000-9000-000000000502}">
+      <Declaration><![CDATA[METHOD PROTECTED M_CallCylinders
+// Wywolanie wszystkich silownikow z ich sygnalami wejsciowymi
+// oraz zebranie zbiorczych warunkow mechaniki.
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbBlock(
+	eMode		:= eMode,
+	xSafetyOK	:= xSafetyOK,
+	xSwExtRaw	:= stIn.xBlockUpSw,
+	xSwRetRaw	:= stIn.xBlockDownSw
+);
+
+fbJawLift(
+	eMode		:= eMode,
+	xSafetyOK	:= xSafetyOK,
+	xSwExtRaw	:= stIn.xJawLiftUpSw,
+	xSwRetRaw	:= stIn.xJawLiftDownSw
+);
+
+
+// Para szczek jest otwarta dopiero gdy OBA silowniki
+// zglaszaja otwarcie
+xAllJawsOpen	:= TRUE;
+xAllJawsClosed	:= TRUE;
+
+FOR j := 1 TO 3 DO
+
+	fbJaw[j](
+		eMode		:= eMode,
+		xSafetyOK	:= xSafetyOK,
+		xSwExtRaw	:= FALSE,
+		xSwRetRaw	:= stIn.axJawOpenSw[j, 1] AND stIn.axJawOpenSw[j, 2]
+	);
+
+	IF NOT fbJaw[j].xRetracted THEN
+		xAllJawsOpen := FALSE;
+	END_IF
+
+	IF NOT fbJaw[j].xExtended THEN
+		xAllJawsClosed := FALSE;
+	END_IF
+
+END_FOR
+
+
+xAllPullBack := TRUE;
+
+FOR j := 1 TO 6 DO
+
+	fbPull[j](
+		eMode		:= eMode,
+		xSafetyOK	:= xSafetyOK,
+		diPosRaw	:= stIn.adiPullPos[j]
+	);
+
+	IF NOT fbPull[j].xRetracted THEN
+		xAllPullBack := FALSE;
+	END_IF
+
+END_FOR
+
+
+// Wolna droga dla wjazdu. Blokada nie jest tu warunkiem -
+// podnosi sie dopiero wtedy, gdy z poprzedniej stacji rusza
+// paleta, wiec przy pustej stacji stoi w dole.
+xEntryReady := fbJawLift.xRetracted AND xAllJawsOpen AND xAllPullBack;
+
+xHomePosition := xEntryReady AND fbBlock.xExtended;
+
+
+M_ScanCylinderFaults();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_MapOutputs" Id="{7b2d0503-0000-4000-9000-000000000503}">
+      <Declaration><![CDATA[METHOD PROTECTED M_MapOutputs
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stOut.xBlockExtend		:= fbBlock.xCoilExtend;
+stOut.xBlockRetract		:= fbBlock.xCoilRetract;
+
+stOut.xJawLiftExtend	:= fbJawLift.xCoilExtend;
+stOut.xJawLiftRetract	:= fbJawLift.xCoilRetract;
+
+FOR j := 1 TO 3 DO
+	stOut.axJawClose[j] := fbJaw[j].xCoilExtend;
+END_FOR
+
+FOR j := 1 TO 6 DO
+	stOut.axPullUp[j]	:= fbPull[j].xCoilExtend;
+	stOut.axPullDown[j]	:= fbPull[j].xCoilRetract;
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_HomeCycle" Id="{7b2d0504-0000-4000-9000-000000000504}">
+      <Declaration><![CDATA[METHOD PROTECTED M_HomeCycle
+// Sprowadzenie mechaniki do polozenia gotowosci, gdy stacja
+// jest pusta: szczeki otwarte i opuszczone, silowniki
+// rozrywajace wycofane.
+//
+// BLOKADY TU NIE RUSZAMY. Podnosi sie dopiero w chwili, gdy
+// z poprzedniej stacji rusza paleta - patrz M_BeginInfeed.
+// Podnoszenie jej na czasowke po zjezdzie poprzedniej palety
+// oznaczaloby zgadywanie, czy paleta zeszla juz z blokady.
+//
+// Poza stanem pustym komendy zostaja takie, jakie zostawila
+// sekwencja testu.
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF (eState <> NODE_EMPTY) AND (eState <> NODE_INIT) THEN
+	RETURN;
+END_IF
+
+fbJawLift.M_Retract();
+
+FOR j := 1 TO 3 DO
+	fbJaw[j].M_Retract();
+END_FOR
+
+FOR j := 1 TO 6 DO
+	fbPull[j].M_Retract();
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_BeginInfeed" Id="{7b2d050e-0000-4000-9000-00000000050e}">
+      <Declaration><![CDATA[METHOD PUBLIC M_BeginInfeed
+// Poprzednia stacja wlasnie ruszyla z paleta.
+//
+// To jest moment na podniesienie blokady: droga jest wolna,
+// paleta dopiero wjezdza, a czasu na ruch jest tyle, ile trwa
+// przejazd miedzy stacjami. Nie zgadujemy niczego czasowka.
+VAR_INPUT
+	pSource		: POINTER TO FB_TransportNodeBase;
+	xNok		: BOOL;
+	nLoadId		: UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[SUPER^.M_BeginInfeed(
+	pSource	:= pSource,
+	xNok	:= xNok,
+	nLoadId	:= nLoadId
+);
+
+fbBlock.M_Extend();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ScanCylinderFaults" Id="{7b2d050f-0000-4000-9000-00000000050f}">
+      <Declaration><![CDATA[METHOD PROTECTED M_ScanCylinderFaults
+// Pierwszy silownik w bledzie zostaje wskazany na wyjsciu,
+// a stacja idzie w alarm. Kolejne go nie nadpisuja - operator
+// ma zobaczyc przyczyne, nie skutek.
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nFaultyCyl <> 0 THEN
+	RETURN;
+END_IF
+
+FOR j := 1 TO 3 DO
+	IF fbJaw[j].xAlarm AND (nFaultyCyl = 0) THEN
+		nFaultyCyl	:= j;
+		eCylAlarm	:= fbJaw[j].eAlarm;
+	END_IF
+END_FOR
+
+IF fbBlock.xAlarm AND (nFaultyCyl = 0) THEN
+	nFaultyCyl	:= 4;
+	eCylAlarm	:= fbBlock.eAlarm;
+END_IF
+
+IF fbJawLift.xAlarm AND (nFaultyCyl = 0) THEN
+	nFaultyCyl	:= 5;
+	eCylAlarm	:= fbJawLift.eAlarm;
+END_IF
+
+FOR j := 1 TO 6 DO
+	IF fbPull[j].xAlarm AND (nFaultyCyl = 0) THEN
+		nFaultyCyl	:= 5 + j;
+		eCylAlarm	:= fbPull[j].eAlarm;
+	END_IF
+END_FOR
+
+IF nFaultyCyl <> 0 THEN
+	M_RaiseAlarm(eNew := ALM_OPERATION_FAILED);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_WhyCannotAccept" Id="{7b2d0505-0000-4000-9000-000000000505}">
+      <Declaration><![CDATA[METHOD PUBLIC M_WhyCannotAccept : E_WaitCause
+// Warunki klasy bazowej plus wlasne: paleta nie ma prawa
+// wjechac, dopoki blokada nie stoi w gorze, a szczeki nie sa
+// otwarte i opuszczone.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_WhyCannotAccept := SUPER^.M_WhyCannotAccept();
+
+IF M_WhyCannotAccept <> WAIT_NONE THEN
+	RETURN;
+END_IF
+
+IF NOT xEntryReady THEN
+	M_WhyCannotAccept := WAIT_STATION_NOT_READY;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationRequired" Id="{7b2d0506-0000-4000-9000-000000000506}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationRequired : BOOL
+// Zawsze TRUE. Nawet paleta odrzucona i nawet przy wylaczonym
+// tescie musi sie tu zatrzymac - blokada stoi w punkcie
+// zatrzymania i trzeba ja opuscic, zanim paleta pojedzie dalej.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationRequired := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_TestEnabled" Id="{7b2d0507-0000-4000-9000-000000000507}">
+      <Declaration><![CDATA[METHOD PROTECTED M_TestEnabled : BOOL
+// Czy dla tej palety w ogole robimy test.
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_TestEnabled := FALSE;
+
+IF pP = 0 THEN
+	RETURN;
+END_IF
+
+// Operator wylaczyl stacje
+IF NOT pP^.Cfg.xStationEnabled THEN
+	RETURN;
+END_IF
+
+// Paleta juz odrzucona - zadnych dalszych testow
+IF pP^.Mem.xLoadNok THEN
+	RETURN;
+END_IF
+
+M_TestEnabled := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_OperationCycle" Id="{7b2d0508-0000-4000-9000-000000000508}">
+      <Declaration><![CDATA[METHOD PROTECTED M_OperationCycle : BOOL
+// Sekwencja stacji. Zwraca TRUE, gdy paleta moze jechac dalej.
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_OperationCycle := FALSE;
+
+IF pSt = 0 THEN
+	M_RaiseAlarm(eNew := ALM_NOT_CONFIGURED);
+	RETURN;
+END_IF
+
+
+// ---------------------------------------------------------
+// WATCHDOG CALEJ OPERACJI
+// ---------------------------------------------------------
+
+tonOpWd(IN := (nTestStep <> ST5_IDLE), PT := pSt^.tOpWatchdog);
+
+IF tonOpWd.Q THEN
+	M_RaiseAlarm(eNew := ALM_OPERATION_FAILED);
+	RETURN;
+END_IF
+
+
+CASE nTestStep OF
+
+ST5_IDLE:
+	// Start operacji dla nowej palety
+	nWaitPull := 0;
+
+	FOR j := 1 TO 6 DO
+		axBoardBroken[j]	:= FALSE;
+		axPullDone[j]		:= FALSE;
+	END_FOR
+
+	tonSeq(IN := FALSE);
+
+	IF M_TestEnabled() THEN
+		nTestStep := ST5_DELAY;
+	ELSE
+		// Bez testu idziemy przez wycofywanie mechaniki, a nie
+		// prosto do blokady. Przy pustej stacji te kroki mijaja
+		// natychmiast, ale gdy test zostal przerwany w polowie
+		// i paleta stala sie NOK - szczeki i silowniki moga byc
+		// w dowolnym polozeniu i trzeba je najpierw sciagnac.
+		nTestStep := ST5_JAWS_OPEN;
+	END_IF
+
+
+ST5_DELAY:
+	tonSeq(IN := TRUE, PT := pSt^.tDetectToLift);
+
+	IF tonSeq.Q THEN
+		tonSeq(IN := FALSE);
+		nTestStep := ST5_JAWLIFT_UP;
+	END_IF
+
+
+ST5_JAWLIFT_UP:
+	fbJawLift.M_Extend();
+
+	IF fbJawLift.xExtended THEN
+		nTestStep := ST5_JAWS_CLOSE;
+	END_IF
+
+
+ST5_JAWS_CLOSE:
+	FOR j := 1 TO 3 DO
+		fbJaw[j].M_Extend();
+	END_FOR
+
+	IF xAllJawsClosed THEN
+		nTestStep := ST5_SETTLE;
+	END_IF
+
+
+ST5_SETTLE:
+	tonSeq(IN := TRUE, PT := pSt^.tJawsToPull);
+
+	IF tonSeq.Q THEN
+		tonSeq(IN := FALSE);
+		nTestStep := ST5_PULL;
+	END_IF
+
+
+ST5_PULL:
+	M_PullCycle();
+
+	IF xAllPullBack AND (nWaitPull = 0) THEN
+		nTestStep := ST5_JAWS_OPEN;
+	END_IF
+
+
+ST5_JAWS_OPEN:
+	// Silowniki rozrywajace sciagamy takze tutaj - tedy prowadzi
+	// droga wyjscia z przerwanego testu
+	FOR j := 1 TO 6 DO
+		fbPull[j].M_Retract();
+	END_FOR
+
+	FOR j := 1 TO 3 DO
+		fbJaw[j].M_Retract();
+	END_FOR
+
+	IF xAllJawsOpen AND xAllPullBack THEN
+		nTestStep := ST5_JAWLIFT_DOWN;
+	END_IF
+
+
+ST5_JAWLIFT_DOWN:
+	fbJawLift.M_Retract();
+
+	IF fbJawLift.xRetracted THEN
+		nTestStep := ST5_BLOCK_DOWN;
+	END_IF
+
+
+ST5_BLOCK_DOWN:
+	fbBlock.M_Retract();
+
+	IF fbBlock.xRetracted THEN
+		nTestStep := ST5_DONE;
+	END_IF
+
+
+ST5_DONE:
+	// Wyjazd dozwolony dopiero gdy WSZYSTKO jest wycofane
+	IF NOT xAllJawsOpen THEN
+		RETURN;
+	END_IF
+
+	IF NOT fbJawLift.xRetracted THEN
+		RETURN;
+	END_IF
+
+	IF NOT xAllPullBack THEN
+		RETURN;
+	END_IF
+
+	IF NOT fbBlock.xRetracted THEN
+		RETURN;
+	END_IF
+
+	tonOpWd(IN := FALSE);
+	nTestStep			:= ST5_IDLE;
+	M_OperationCycle	:= TRUE;
+
+
+ELSE
+	nTestStep := ST5_IDLE;
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_PullCycle" Id="{7b2d0509-0000-4000-9000-000000000509}">
+      <Declaration><![CDATA[METHOD PROTECTED M_PullCycle
+// Rozrywanie. Kazdy silownik prowadzony OSOBNO - maja rozne
+// predkosci, wiec kazdy dochodzi do progu w innej chwili
+// i kazdy ma wlasny licznik czasu trzymania nacisku.
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[nWaitPull := 0;
+
+FOR j := 1 TO 6 DO
+
+	M_PullOne(j := j);
+
+	IF NOT axPullDone[j] THEN
+		nWaitPull := j;
+	END_IF
+
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_PullOne" Id="{7b2d050a-0000-4000-9000-00000000050a}">
+      <Declaration><![CDATA[METHOD PROTECTED M_PullOne
+// Jeden silownik rozrywajacy.
+//
+// Kolejnosc warunkow jest istotna: najpierw sprawdzamy, czy
+// deska odpadla, i dopiero potem czy nacisk zostal utrzymany.
+// Odwrotnie mozna by uznac za dobra deske, ktora wlasnie pekla.
+VAR_INPUT
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Ten juz zbadany - wraca do bazy
+IF axPullDone[j] THEN
+	fbPull[j].M_Retract();
+	RETURN;
+END_IF
+
+
+// Wysunal sie dalej, niz moglby z cala paleta - deska odpadla
+IF fbPull[j].xOverLimit THEN
+	axBoardBroken[j]	:= TRUE;
+	axPullDone[j]		:= TRUE;
+
+	IF pP <> 0 THEN
+		pP^.Mem.xLoadNok	:= TRUE;
+		xPersistDirty		:= TRUE;
+	END_IF
+
+	fbPull[j].M_Retract();
+	RETURN;
+END_IF
+
+
+// Nacisk utrzymany przez nastawiony czas - deska wytrzymala
+IF fbPull[j].xHoldDone THEN
+	axPullDone[j] := TRUE;
+	fbPull[j].M_Retract();
+	RETURN;
+END_IF
+
+
+fbPull[j].M_Extend();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_Reset" Id="{7b2d050b-0000-4000-9000-00000000050b}">
+      <Declaration><![CDATA[METHOD PUBLIC M_Reset : BOOL
+VAR
+	j	: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbBlock.M_Reset();
+fbJawLift.M_Reset();
+
+FOR j := 1 TO 3 DO
+	fbJaw[j].M_Reset();
+END_FOR
+
+FOR j := 1 TO 6 DO
+	fbPull[j].M_Reset();
+END_FOR
+
+tonSeq(IN := FALSE);
+tonOpWd(IN := FALSE);
+
+nTestStep	:= ST5_IDLE;
+nWaitPull	:= 0;
+nFaultyCyl	:= 0;
+eCylAlarm	:= ALM_CYL_NONE;
+
+M_Reset := SUPER^.M_Reset();
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ManCylinder" Id="{7b2d050c-0000-4000-9000-00000000050c}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ManCylinder
+// Sterowanie reczne pojedynczym silownikiem stacji.
+// nSel: 1..3 szczeki, 4 blokada, 5 podnoszenie szczek,
+//       6..11 silowniki rozrywajace 1..6
+VAR_INPUT
+	nSel	: INT;
+	xExt	: BOOL;
+	xRet	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF (nSel >= 1) AND (nSel <= 3) THEN
+	fbJaw[nSel].M_ManJog(xExt := xExt, xRet := xRet);
+	RETURN;
+END_IF
+
+IF nSel = 4 THEN
+	fbBlock.M_ManJog(xExt := xExt, xRet := xRet);
+	RETURN;
+END_IF
+
+IF nSel = 5 THEN
+	fbJawLift.M_ManJog(xExt := xExt, xRet := xRet);
+	RETURN;
+END_IF
+
+IF (nSel >= 6) AND (nSel <= 11) THEN
+	fbPull[nSel - 5].M_ManJog(xExt := xExt, xRet := xRet);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="M_ZeroPull" Id="{7b2d050d-0000-4000-9000-00000000050d}">
+      <Declaration><![CDATA[METHOD PUBLIC M_ZeroPull : BOOL
+// Bazowanie przetwornikow silownikow rozrywajacych.
+// Zero jest na silowniku WYCOFANYM, bez palety.
+// nSel = 0 zeruje wszystkie naraz.
+VAR_INPUT
+	nSel	: INT;
+END_VAR
+VAR
+	j		: INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_ZeroPull := FALSE;
+
+IF nSel = 0 THEN
+	FOR j := 1 TO 6 DO
+		fbPull[j].M_Zero();
+	END_FOR
+	M_ZeroPull := TRUE;
+	RETURN;
+END_IF
+
+IF (nSel < 1) OR (nSel > 6) THEN
+	RETURN;
+END_IF
+
+M_ZeroPull := fbPull[nSel].M_Zero();
+]]></ST>
+      </Implementation>
+    </Method>
+
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,4539 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="MAIN" Id="{3723006f-8e56-479b-b982-5b261f2b6738}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+// =============================================================
+// TEST RUCHU TRANSPORTEROW
+// =============================================================
+//
+// Proba na maszynie: jedna paleta idzie trasa, w kazdym kroku
+// pracuje PARA transporterow - ten, z ktorego paleta zjezdza,
+// i ten, na ktory wjezdza.
+//
+// -------------------------------------------------------------
+// CZUJNIKI
+// -------------------------------------------------------------
+// Podpiete czujniki koncza przejazd zamiast czasowki.
+//
+//   xUseSensors   = FALSE  wracamy na same czasowki, jak dotad
+//   xStepWatchdog = FALSE  krok czeka na czujnik BEZ KONCA
+//
+// Na czas recznego wyzwalania czujnikow watchdog jest WYLACZONY:
+// zaden krok nie przeskoczy sam, dopoki nie podasz sygnalu.
+// Po podpieciu prawdziwych czujnikow warto go wlaczyc - wtedy
+// martwy czujnik nie zatrzyma proby, tylko zglosi sie sam przez
+// xStepTimeout i licznik nTimeouts.
+//
+// Kroki konczone czujnikiem:
+//   st.2 -> st.3    IN2      st.7 -> st.8    IN7
+//   st.3 -> st.4    IN3/IN4  st.8 -> st.11   IN8
+//   st.6 -> st.7    IN5      st.12-> st.13   IN6
+//   st.15-> st.16   IN10
+//
+// STACJA 1 nie ma czujnika w tej probie. Zamiast niego dziala
+// bit xSt01_StackReady: TRUE = stoi tam stos i mozna nim jechac,
+// zbocze 0 -> 1 = przyjechal nowy stos (licznik nStacksSeen).
+//
+// STACJA 4 bada JADACA palete - patrz ACT_MoveSt04.
+//
+// Wyjatkiem jest przejazd poprzeczny 8 -> 10: tam paleta lezy
+// na lancuchu, rolki stacji 8 i 10 sa opuszczone i MUSZA stac.
+// Jedzie sam falownik 7, przez tChainTime.
+//
+// -------------------------------------------------------------
+// CO NIE JEST URUCHAMIANE
+// -------------------------------------------------------------
+// Falowniki 1, 2 i 3 sa ZABLOKOWANE w axDriveEnabled:
+//   1  krzywka desztaplarki   - mechanika niegotowa
+//   2  krzywka na stacji 8    - mechanika niegotowa
+//   3  rolki dociskowe st. 4  - to nie jest transporter
+//
+// Blokada dziala niezaleznie od tabeli krokow: nawet gdyby
+// krok zazadal takiego napedu, nie ruszy. Zeby go dopuscic,
+// trzeba swiadomie ustawic bit w axDriveEnabled.
+//
+// -------------------------------------------------------------
+// STEROWANIE
+// -------------------------------------------------------------
+//   START_TEST = TRUE   symulacja ruchu jedzie
+//   START_TEST = FALSE  wszystkie napedy staja
+//
+//   xCmdResetDrives     kasuje bledy wszystkich falownikow,
+//                       dziala na zbocze i sam sie zdejmuje
+//
+// Po wcisnieciu START maszyna sama sprawdza, czy ktorys naped
+// nie stoi w bledzie, i probuje go skasowac - zanim cokolwiek
+// ruszy. Jesli sie nie uda, zapala sie xResetFailed.
+//
+// Pelna aplikacja siedzi w PRG_Machine i na razie nie jest
+// wywolywana.
+VAR
+
+	// =========================================================
+	// STEROWANIE
+	// =========================================================
+
+	// GLOWNY BIT TESTU TRASY. TRUE = jedziemy, FALSE = stop.
+	START_TEST			: BOOL;
+
+
+	// =========================================================
+	// PROBA CALOSCIOWA: DOWOZ -> DESZTAPLOWANIE -> STACJA 4
+	// =========================================================
+	//
+	// Niezalezna od START_TEST. Wozi palety ze stacji 1 do
+	// desztaplarki, potem kazda zwolniona palete przez stacje 4
+	// z testem dociskow i ZATRZYMUJE ja na koncu stacji 4.
+	// Palete zabiera sie stamtad recznie.
+
+	// Potwierdzenie operatora: palety leza na stacji 1.
+	// Kod sam go zdejmuje po przyjeciu - kolejny stos wymaga
+	// podania go od nowa.
+	xSt01_StackReady	: BOOL;
+
+	// Start dowozu i obslugi transportu w tej probie
+	START_FEED			: BOOL;
+
+	// Ile palet przeszlo przez stacje 4
+	nFeedPallets		: UDINT;
+
+	// Podglad
+	nFeedStep			: INT;
+	sFeedPhase			: STRING(79);
+
+	// Wewnetrzne sekwencji dowozu
+	nFeedStepOld		: INT;
+	xFeedNewStep		: BOOL;
+	xFeedArmed			: BOOL;
+	xFeedAdvance		: BOOL;
+	tFeedStep			: TIME;
+	tonFeedStep			: TON;
+	rtrgFeedStart		: R_TRIG;
+
+	// =========================================================
+	// TOR WYJSCIOWY - DRUGA PALETA W MASZYNIE
+	// =========================================================
+	//
+	// Transport jest rozbity na DWA niezalezne tory:
+	//
+	//   nFeedStep  tor A: stacja 1 -> 3 -> 4 -> cykl stacji 5
+	//   nOutStep   tor B: stacja 5 -> 6 -> ... -> 16
+	//
+	// Dzieki temu paleta po rozrywaniu jedzie w strone stacji 16
+	// SAMA, a desztaplarka moze w tym czasie wydac nastepna.
+	// W maszynie sa wtedy dwie palety naraz.
+	//
+	// Zasob wspolny to transporter stacji 5 (naped 5) i blokada.
+	// Dlatego tor A nie wjedzie na stacje 5, dopoki tor B z niej
+	// nie zjedzie - patrz krok 75.
+	//
+	// nOutStep = 0 znaczy TOR B WOLNY.
+
+	nOutStep			: INT;
+	sOutPhase			: STRING(79);
+
+	nOutStepOld			: INT;
+	xOutNewStep			: BOOL;
+	xOutArmed			: BOOL;
+	xOutAdvance			: BOOL;
+	tOutStep			: TIME;
+	tonOutStep			: TON;
+
+	// Stacja 5 skonczyla cykl i oddala palete torowi B.
+	// Na tym sygnale desztaplarka wypuszcza nastepna palete.
+	xSt05_Done			: BOOL;
+
+	// Zadania startu torow. Tor URUCHAMIA SIE SAM, w swoim kroku 0.
+	// Powod jest w komentarzu przy silniku krokow nizej - w skrocie:
+	// krok wpisany z ZEWNATRZ wykonalby sie jeszcze w tym samym
+	// cyklu, ze stara flaga xOutAdvance, i przeskoczylby natychmiast.
+	// -----------------------------------------------------
+	// STACJA 8 - POSADZENIE PALETY NOK NA LANCUCHU
+	// -----------------------------------------------------
+	//
+	// Na stacji 8 nie ma blokady, a transporter chodzi tak
+	// gladko, ze paleta zatrzymuje sie raz dalej, raz blizej.
+	// Dlatego po tSt08_DropDelay od IN7 OPUSZCZAMY rolki: paleta
+	// siada na lancuchu i to on ja wyhamowuje - zawsze tak samo.
+	//
+	// DOTYCZY WYLACZNIE PALET NOK, bo tylko one jada lancuchem.
+	// Paleta OK jedzie dalej rolkami i zatrzymuje sie jak dotad -
+	// dla niej nic sie nie zmienia.
+	//
+	// Dwie NIEZALEZNE czasowki od tego samego IN7:
+	//   tFeedSt08Stop   zdjecie zadania z falownika (dobieg)
+	//   tSt08_DropDelay opuszczenie rolek pod paleta
+	tSt08_DropDelay		: TIME := T#830MS;
+	tonSt08Drop			: TON;
+
+	// Zatrzask: rolki stacji 8 maja zostac w dole, dopoki lancuch
+	// nie zabierze palety. Bez niego kroki, ktore ich nie pisza,
+	// podnosilyby je z powrotem.
+	xSt08_RollDown		: BOOL;
+
+	// Paleta jest na stacji 8 - od potwierdzenia IN7 do zabrania
+	// jej przez lancuch. Na tej fladze chodzi tonSt08Drop, dzieki
+	// czemu odliczanie NIE ZALEZY od tego, w ktorym kroku toru B2
+	// paleta akurat stoi.
+	xSt08_AtStation		: BOOL;
+
+	// Czy TA paleta jedzie trasa odrzutu (lancuchem).
+	// W tej probie wszystkie palety jada na stacje 16, wiec bit
+	// jest TRUE. Gdy dojdzie klasyfikacja OK/NOK, ma go ustawiac
+	// wynik badania, a nie operator.
+	xSt08_PalletNOK		: BOOL := TRUE;
+
+	xOutStart			: BOOL;
+	xOut2Start			: BOOL;
+	xOut3Start			: BOOL;
+
+	// Droga ze stacji 5 wolna: tor B1 pusty i stacja 7 pusta
+	xSt05_CanPass		: BOOL;
+
+	// -----------------------------------------------------
+	// BUFOROWANIE - TOR B ROZBITY NA TRZY ODCINKI
+	// -----------------------------------------------------
+	//
+	// Odcinki wyznaczaja CZUJNIKI, bo tylko one wiedza, gdzie
+	// naprawde stoi paleta:
+	//
+	//   nOutStep   B1  st.5 -> 6 -> 7    konczy sie na IN5
+	//   nOut2Step  B2  st.7 -> 8         konczy sie na IN7
+	//   nOut3Step  B3  st.8 -> ... -> 16 konczy sie na IN10
+	//
+	// Kazdy odcinek zwalnia sie DOPIERO wtedy, gdy nastepny
+	// przejmie palete. Dzieki temu w obiegu moga byc naraz:
+	// paleta na stacji 5, paleta na 7, paleta na 8 i paleta
+	// w drodze na 16 - zamiast jednej na cala maszyne.
+	//
+	// Transporter stacji 7 (naped 11) obsluguje B1 i B2, a rolki
+	// stacji 8 (naped 12) B2. Dlatego paleta czeka w krokach
+	// 205 i 218 z ZATRZYMANYMI napedami, zamiast dojezdzac
+	// wprost na zajety odcinek.
+
+	nOut2Step			: INT;
+	sOut2Phase			: STRING(79);
+	nOut2StepOld		: INT;
+	xOut2NewStep		: BOOL;
+	xOut2Armed			: BOOL;
+	xOut2Advance		: BOOL;
+	tOut2Step			: TIME;
+	tonOut2Step			: TON;
+
+	nOut3Step			: INT;
+	sOut3Phase			: STRING(79);
+	nOut3StepOld		: INT;
+	xOut3NewStep		: BOOL;
+	xOut3Armed			: BOOL;
+	xOut3Advance		: BOOL;
+	tOut3Step			: TIME;
+	tonOut3Step			: TON;
+
+	// -----------------------------------------------------
+	// STACJA 5 - CZAS PCHANIA PALETY DO BLOKADY
+	// -----------------------------------------------------
+	//
+	// Paleta opiera sie o blokade duzo wczesniej, niz konczy sie
+	// krok 80. Kazda sekunda ponad to jest transporterem
+	// mielacym pod stojaca paleta - tak przeciazamy naped 5.
+	// Po tym czasie napedy 4 i 5 STAJA, a krok trwa dalej.
+	//
+	// DOMYSLNIE ROWNE tFeedToSt05 - czyli tak, jak bylo przed
+	// wprowadzeniem tej nastawy. Moje 4 s bylo za krotkie
+	// i paleta nie dojezdzala do blokady.
+	//
+	// Skracaj DOPIERO po obejrzeniu, gdzie paleta sie zatrzymuje:
+	// ma byc na tyle dlugie, zeby doszla do blokady, i na tyle
+	// krotkie, zeby transporter nie mielil pod nia bez potrzeby.
+	tSt05_Push			: TIME := T#9S;
+	tonSt05Push			: TON;
+
+	// -----------------------------------------------------
+	// STACJA 4 - ROLKI DOCISKOWE (NAPED 3)
+	// -----------------------------------------------------
+	//
+	// Kreca sie razem z transporterem stacji 4 (naped 4).
+	// Bit ponizej wybiera kierunek obrotu - do ustawienia
+	// online, bez pobierania projektu.
+	xSt04_RollRev		: BOOL := TRUE;
+
+	// Stan dociskow stacji 4 w tej probie - przepisywany co cykl
+	xFeedPressOn		: BOOL;
+	xFeedPressLoOn		: BOOL;
+
+	// Czas przejazdu st.4 -> st.5. Stacja 5 nie ma czujnika,
+	// wiec dojazd konczy sie czasowka. Dobrane na maszynie.
+	tFeedToSt05			: TIME := T#9S;
+
+	// DOBIEG NA STACJI 3. Czujnik IN2 widzi krawedz natarcia
+	// stosu, a szczeki maja trafic pod DRUGA palete od dolu -
+	// stos musi wiec dojechac jeszcze kawalek po wykryciu.
+	//
+	// ZERO = stop natychmiast po czujniku, czyli tak, jak bylo.
+	// Odpowiednik tSt04_StopDelay dla stacji 4.
+	tFeedSt03Stop		: TIME := T#0S;
+
+	// Odstep od zatrzymania palety na stacji 5 do ruszenia
+	// mechaniki. Stacja 5 nie ma czujnika, wiec nie wiemy, kiedy
+	// paleta oprze sie o blokade - dajemy jej na to czas.
+	tSt05_Settle		: TIME := T#8S;
+
+	// Stan mechaniki stacji 5 w tej probie - kazdy krok podaje
+	// swoj pelny stan, cewki przepisujemy co cykl.
+	xFeed05_Block		: BOOL;		// blokada wysunieta
+	xFeed05_Lift		: BOOL;		// szczeki podniesione
+	xFeed05_Jaws		: BOOL;		// szczeki zamkniete
+	xFeed05_Pull		: BOOL;		// silowniki rozrywajace w gorze
+
+	// Diagnostyka napedow zadanych przez biezacy krok
+	nFeedBadDrv			: INT;
+	sFeedDrvWhy			: STRING(31);
+	tonFeedDrv			: TON;
+
+	// -----------------------------------------------------
+	// CZASOWKI PRZEJAZDOW BEZ CZUJNIKA
+	// -----------------------------------------------------
+	//
+	// Odcinki, na ktorych nie ma czym potwierdzic dojazdu.
+	// Tam, gdzie czujnik jest, czasowka nie jest uzywana wcale.
+
+	tFeed5to6			: TIME := T#12S;		// st.5 -> st.6
+	tFeed9Chain			: TIME := T#19S;		// lancuch st.8 -> st.10
+	tFeed10to14			: TIME := T#8S;		// st.10 -> st.14
+	tFeed14to15			: TIME := T#8S;		// st.14 -> st.15
+
+	// Paleta zniknela z czujnika stacji 16. Po tym czasie
+	// uznajemy stacje za pusta - odbiera ja operator.
+	tSt16_Clear			: TIME := T#4S;
+
+	// -----------------------------------------------------
+	// DOBIEGI PO CZUJNIKACH
+	// -----------------------------------------------------
+	//
+	// Czujnik widzi krawedz natarcia palety, a ona ma stanac
+	// na srodku stacji. ZERO = stop natychmiast po czujniku.
+	// Odpowiedniki tFeedSt03Stop i tSt04_StopDelay.
+
+	tFeedSt08Stop		: TIME := T#740MS;		// IN7  stacja 8
+	tFeedSt16Stop		: TIME := T#0S;		// IN10 stacja 16
+
+	// Rolki podnoszone stacji 8 i 10. TRUE = w gorze, czyli
+	// transport wzdluz. Na czas przejazdu lancuchem OBIE musza
+	// zejsc, inaczej szarpalyby palete z dwoch stron.
+	xFeedRoll08Up		: BOOL := TRUE;
+	xFeedRoll10Up		: BOOL := TRUE;
+
+	// Zezwolenie z lancucha bezpieczenstwa
+	xSafetyOK			: BOOL := TRUE;
+
+	// KASOWANIE BLEDOW WSZYSTKICH FALOWNIKOW - dziala na zbocze.
+	// Bit sam sie zdejmuje po wystawieniu impulsu.
+	xCmdResetDrives		: BOOL;
+
+	// Automatyczne kasowanie bledow po wcisnieciu START.
+	// FALSE = start nie probuje niczego kasowac.
+	xAutoResetOnStart	: BOOL := TRUE;
+
+	// Odstep miedzy kolejnymi probami kasowania
+	tResetGap			: TIME := T#1S;
+
+	// Czestotliwosc BAZOWA transporterow [Hz]. Uzywana wszedzie,
+	// gdzie alrDriveFreq nie ma wpisanej wlasnej wartosci.
+	lrTestFreq			: LREAL := 20.0;
+
+	// =========================================================
+	// CZESTOTLIWOSC OSOBNO DLA KAZDEGO NAPEDU [Hz]
+	// =========================================================
+	//
+	// Zero znaczy "uzyj lrTestFreq". Wpisanie liczby dotyczy
+	// tylko tego jednego falownika.
+	//
+	// Przydzial stacja -> falownik:
+	//   st.1  -> 8     st.5  -> 5     st.9  -> 7      st.13 -> 15
+	//   st.2  -> 9     st.6  -> 6     st.10 -> 16     st.14 -> 17
+	//   st.3  -> 10    st.7  -> 11    st.11 -> 13     st.15 -> 18
+	//   st.4  -> 4     st.8  -> 12    st.12 -> 14     st.16 -> 19
+	//
+	// Krzywki 1 i 2 maja wlasna lrCamFreq i ta tablica ich nie
+	// dotyczy.
+	//
+	// UWAGA: naped czyta czestotliwosc przy STARCIE (M_Start jest
+	// wolane na zboczu). Zmiana w trakcie jazdy zadziala dopiero
+	// przy nastepnym ruszeniu.
+
+	alrDriveFreq		: ARRAY[1..20] OF LREAL;
+
+	// Czas jednego kroku - przejazd palety miedzy stacjami
+	tStepTime			: TIME := T#5S;
+
+	// Przejazd poprzeczny transporterem lancuchowym jest dluzszy
+	tChainTime			: TIME := T#6S;
+
+	// Czas jednego ruchu silownika. Czujnikow polozenia jeszcze
+	// nie ma, wiec po tym czasie uznajemy ruch za wykonany.
+	tCylTime			: TIME := T#2S;
+
+	// Stacja 4 - dociski gorne i dolne maja isc praktycznie razem.
+	// Gorne schodza pierwsze, dolne po tym krotkim odstepie,
+	// zeby dolne nie uniosly palety. Cofanie jest jednoczesne.
+	tSt04_UpToLo		: TIME := T#2200MS;
+
+	// FALSE = same transportery, silowniki stoja
+	xCylEnable			: BOOL := TRUE;
+
+
+	// =========================================================
+	// CZUJNIKI
+	// =========================================================
+	//
+	// FALSE = jedziemy na samych czasowkach, tak jak dotad.
+	// TRUE  = kroki wypisane w ACT_Move koncza sie czujnikiem,
+	//         a czasowka pracuje juz tylko jako watchdog.
+
+	xUseSensors			: BOOL := TRUE;
+
+	// STACJA 1 - czujnika IN1 NIE uzywamy. Zastepuje go bit
+	// xSt01_StackReady zadeklarowany na gorze.
+	nStacksSeen			: UDINT;
+
+	// Obraz czujnikow sprowadzony do JEDNEGO znaczenia:
+	// TRUE = PALETA JEST. Polaryzacje ustawia ACT_Inputs i tylko on.
+	xPal_St03			: BOOL;		// IN2   stacja 3
+	xPal_St04In			: BOOL;		// IN3   wjazd na stacje 4
+	xPal_St04End		: BOOL;		// IN4   koniec testu desek
+	xPal_St07			: BOOL;		// IN5   stacja 7
+	xPal_St13			: BOOL;		// IN6   koniec stacji 13
+	xPal_St08			: BOOL;		// IN7   stacja 8
+	xPal_St11			: BOOL;		// IN8   stacja 11
+	xPal_St16			: BOOL;		// IN10  stacja 16
+
+	// Surowe wejscia - do podgladu bez otwierania GVL
+	axInRaw				: ARRAY[1..10] OF BOOL;
+
+	// -----------------------------------------------------
+	// POLARYZACJA CZUJNIKOW - JEDYNE MIEJSCE
+	// -----------------------------------------------------
+	//
+	// TRUE  = czujnik ROZWIERA przy palecie (0 = paleta)
+	// FALSE = czujnik ZWIERA przy palecie   (1 = paleta)
+	//
+	// Wartosci ponizej sa wg opisu z maszyny. Jesli ktorys
+	// czujnik zachowa sie odwrotnie, przestawia sie JEDEN bit
+	// online - bez zmiany kodu i bez pobierania projektu.
+	//
+	//   1  st.1              nieuzywany
+	//   2  st.3              ROZWIERA - stwierdzone na maszynie,
+	//                        wbrew pierwotnemu opisu
+	//   3  wjazd st.4        rozwiera
+	//   4  koniec testu st.4 rozwiera
+	//   5  st.7              zwiera
+	//   6  koniec st.13      rozwiera
+	//   7  st.8              zwiera
+	//   8  st.11             zwiera
+	//   9  niepodlaczony
+	//  10  st.16             zwiera
+
+	axInInverted		: ARRAY[1..10] OF BOOL :=
+	                      [FALSE, TRUE, TRUE, TRUE, FALSE,
+	                       TRUE, FALSE, FALSE, FALSE, FALSE];
+
+	// WATCHDOG KROKU CZUJNIKOWEGO.
+	//
+	// FALSE = krok czeka na czujnik BEZ KONCA. Tak jedziemy przy
+	//         recznym wyzwalaniu czujnikow - nic nie przeskoczy
+	//         kroku, dopoki sam nie podasz sygnalu.
+	// TRUE  = po tMoveTimeout krok konczy sie mimo wszystko,
+	//         zapala sie xStepTimeout i rosnie nTimeouts.
+	xStepWatchdog		: BOOL := FALSE;
+
+	tMoveTimeout		: TIME := T#20S;
+	xStepTimeout		: BOOL;
+	nTimeouts			: UDINT;
+
+
+	// =========================================================
+	// STACJA 4 - TEST NA JADACEJ PALECIE
+	// =========================================================
+	//
+	// Paleta nie zatrzymuje sie pod rolkami. Czujnik wjazdu (IN3)
+	// odlicza tSt04_EntryToPress i wtedy rolki schodza na deski.
+	// Czujnik konca testu (IN4) NATYCHMIAST je cofa, a transporter
+	// stoi tSt04_StopDelay pozniej - paleta dojezdza do konca stacji.
+
+	tSt04_EntryToPress	: TIME := T#2600MS;
+	tSt04_StopDelay		: TIME := T#300MS;
+
+
+	// =========================================================
+	// SZTAPLARKA I DESZTAPLARKA
+	// =========================================================
+	//
+	// Dwa NIEZALEZNE cykle, kazdy z wlasnym bitem startu. Nie
+	// maja nic wspolnego z START_TEST.
+	//
+	// Poziom TRUE = cykl pracuje.
+	// Poziom FALSE = natychmiastowy stop, hamulec zaklada sie
+	//                tCamBrakeHold pozniej.
+	//
+	// REGULA NADRZEDNA obu maszyn: nic w szczekach = szczeki
+	// OTWARTE i jazda na pozycje DOLNA, niezaleznie od tego,
+	// gdzie wozek stoi. Cykl zaczyna sie i konczy na dole
+	// z otwartymi szczekami.
+
+	START_DESTACK		: BOOL;		// desztaplarka, stacja 3
+	START_STACK			: BOOL;		// sztaplarka, stacja 11
+
+	// -----------------------------------------------------
+	// JAZDA RECZNA KRZYWKA
+	// -----------------------------------------------------
+	//
+	// Trzymasz bit - wozek jedzie. Puszczasz - staje, hamulec
+	// zaklada sie tCamBrakeHold pozniej, tak samo jak w cyklu.
+	//
+	// Dziala TYLKO przy zdjetym starcie danej maszyny, zeby
+	// nigdy nie walczyc z sekwencja. Sluzy do sprawdzenia,
+	// czy enkoder liczy i w ktora strone.
+
+	JOG_DESTACK_FWD		: BOOL;
+	JOG_DESTACK_REV		: BOOL;
+	JOG_STACK_FWD		: BOOL;
+	JOG_STACK_REV		: BOOL;
+
+	xDeJog				: BOOL;
+	xStJog				: BOOL;
+
+	// -----------------------------------------------------
+	// UCZENIE POZYCJI
+	// -----------------------------------------------------
+	//
+	// Dojedz jogiem tam, gdzie wozek ma stawac, i podaj bit.
+	// Zbocze 0 -> 1 przepisuje BIEZACA pozycje enkodera do
+	// odpowiedniej nastawy. Koniec z wpisywaniem liczb z palca.
+	//
+	// UWAGA: nastawy siedza na razie w MAIN, wiec pobranie
+	// projektu je kasuje. Po ustaleniu przenosimy do GVL_PERSIST.
+
+	TEACH_DE_BOTTOM		: BOOL;
+	TEACH_DE_MIDDLE		: BOOL;
+	TEACH_DE_TOP		: BOOL;
+	TEACH_ST_BOTTOM		: BOOL;
+	TEACH_ST_MIDDLE		: BOOL;
+	TEACH_ST_TOP		: BOOL;
+
+	rtrgTeach			: ARRAY[1..6] OF R_TRIG;
+
+	// Ostatnio nauczona pozycja - potwierdzenie na podgladzie
+	sTeachLast			: STRING(79);
+
+	// Czestotliwosc krzywek. Osobno od transporterow.
+	// Nizej niz transportery - wolniej znaczy krotszy dojazd
+	// po zdjeciu zadania, a wiec mniejszy blad pozycji.
+	lrCamFreq			: LREAL := 15.0;
+
+	// Ruch szczek - czujnikow polozenia nie ma
+	tJawTime			: TIME := T#2S;
+
+
+	// Odstep od ZALOZENIA hamulca do chwytu szczekami.
+	// Wozek musi sie uspokoic, zanim szczeki wejda pod palete.
+	tDeGripDelay		: TIME := T#1S;
+
+	// -----------------------------------------------------
+	// POZYCJE I LICZNIKI SIEDZA W GVL_PERSIST
+	// -----------------------------------------------------
+	//
+	// Nastawy:  GVL_PERSIST.St03.Cfg.diPosBottom / Middle / Top
+	//           GVL_PERSIST.St11.Cfg.diPosBottom / Middle / Top
+	//           GVL_PERSIST.St03.Cfg.nStackSize
+	// Liczniki: GVL_PERSIST.St03.Mem.nRemaining / nHeld
+	//           GVL_PERSIST.St11.Mem.nHeld
+	//
+	// Sa NIEULOTNE, wiec przezywaja zanik zasilania, aktywacje
+	// konfiguracji i reset cold. Uczenie pozycji zapisuje wprost
+	// tam - nie ma drugiej kopii, ktora moglaby sie rozjechac.
+
+
+
+	// Wyprzedzenie hamowania - zadanie znika tyle przed celem.
+	// Zaczynamy od zera i ustawiamy z odczytu diCoast.
+	diCamStopLead		: DINT := 0;
+
+	// Okno "jestem na miejscu" przy bazowaniu. Bez niego wozek
+	// stojacy tuz przy dolnej pozycji robilby caly obrot, zeby
+	// do niej "dojechac".
+	diCamTol			: DINT := 300;
+
+	// Ile impulsow za celem uznajemy jeszcze za "jestem".
+	// Musi byc WIEKSZE niz dojazd po zdjeciu zadania, inaczej
+	// wozek stojacy tuz ZA punktem objechalby caly obrot,
+	// zeby do niego wrocic.
+	diCamOvershoot		: DINT := 5000;
+
+	// -----------------------------------------------------
+	// DOKAD JEDZIE BIEZACY KROK
+	// -----------------------------------------------------
+	//
+	// Krok podaje WARTOSC ENKODERA, do ktorej ma dojechac,
+	// a droge liczymy raz, przy wejsciu w krok, z zywej
+	// pozycji. Nigdzie nie zakladamy, ile impulsow ma cykl
+	// maszyny - to bylo zrodlo kumulujacego sie bledu.
+
+	diDeGoToEnc			: DINT;
+	diStGoToEnc			: DINT;
+
+	// -----------------------------------------------------
+	// POMIAR - ILE IMPULSOW MA NAPRAWDE CYKL MASZYNY
+	// -----------------------------------------------------
+	//
+	// diDeCycleCounts   droga przejechana miedzy kolejnymi
+	//                   dolnymi pozycjami. Jesli enkoder jest
+	//                   1:1 z korba, ma byc okolo 65536.
+	//                   Kazda inna liczba znaczy, ze cykl
+	//                   maszyny to nie jest jeden obrot enkodera.
+	// diDeBottomErr     o ile minelismy nauczony dol, ze znakiem
+	// diDeCoastMax      najwiekszy zaobserwowany dojazd. Musi
+	//                   byc MNIEJSZY niz diCamOvershoot, inaczej
+	//                   ruch do punktu tuz za nami pojedzie
+	//                   dookola.
+
+	diDeCycleCounts		: DINT;
+	diDeBottomErr		: DINT;
+	diDeCoastMax		: DINT;
+
+	diStCycleCounts		: DINT;
+	diStBottomErr		: DINT;
+	diStCoastMax		: DINT;
+
+	// Ustawienie punktu odniesienia osi, impuls jednocyklowy
+	xDeSetAccum			: BOOL;
+	xStSetAccum			: BOOL;
+	diDeAccumSet		: DINT;
+	diStAccumSet		: DINT;
+
+	// Roboczy
+	diTmp				: DINT;
+
+	// -----------------------------------------------------
+	// KONTROLA POPRAWNOSCI NASTAW POZYCJI
+	// -----------------------------------------------------
+	//
+	// Trzy pozycje musza byc od siebie ODDALONE. Zerowe albo
+	// pomylone nastawy oznaczaja, ze wozek "juz jest na miejscu"
+	// w kazdym kroku - a wtedy szczeki zamykaja sie na dole,
+	// na stosie. Cykl nie ma prawa ruszyc na takich nastawach.
+
+	xDeCfgOK			: BOOL;
+	xStCfgOK			: BOOL;
+	diCamMinSpan		: DINT := 1000;
+
+	// -----------------------------------------------------
+	// KONTROLA ENKODERA PO STARCIE
+	// -----------------------------------------------------
+	//
+	// Enkoder absolutny powinien utrzymac wartosc przez zanik
+	// zasilania. Zapamietujemy ja na biezaco w GVL_PERSIST
+	// i po starcie porownujemy z odczytem. Zgadza sie -
+	// bazowanie jest zbedne. Nie zgadza sie - kod to zglasza,
+	// zamiast po cichu jechac wedlug zlych pozycji.
+
+	xEncCheckDone		: BOOL;
+	diDeEncJump			: DINT;
+	diStEncJump			: DINT;
+	sEncCheck			: STRING(79);
+
+	// Ile impulsow roznicy jeszcze wybaczamy po starcie
+	diEncCheckTol		: DINT := 500;
+
+	// START: wyprzedzenie zdjecia hamulca przed komenda dla
+	// falownika. ZERO = jednoczesnie, i tak ma byc.
+	tCamBrakeRelease	: TIME := T#0S;
+
+	// STOP: ile hamulec czeka po zdjeciu komendy z falownika.
+	// Rampa hamowania falownika to 1 s, wiec hamulec zaciska sie
+	// na wolno obracajacym sie jeszcze wale - SWIADOMIE, zeby
+	// nie puszczac wozka wolno.
+	tCamBrakeHold		: TIME := T#700MS;
+
+	// Kasowanie czuwaka obu osi, dziala na zbocze
+	RESET_CAM			: BOOL;
+
+	// =========================================================
+	// RESET CYKLU DO ZERA
+	// =========================================================
+	//
+	// Po recznym oproznieniu maszyny z palet. Sprowadza obie
+	// maszyny i transport do kroku 0, zeruje liczniki palet
+	// i uzgodnienia, kasuje czuwaki osi.
+	//
+	// NICZYM NIE RUSZA. Wozki wroca na dol dopiero przy starcie,
+	// bo krok 0 obu maszyn to "szczeki otwarte, jazda na dol".
+	//
+	// Bit sam sie zdejmuje.
+
+	RESET_CYCLE			: BOOL;
+	rtrgResetCycle		: R_TRIG;
+
+	// -----------------------------------------------------
+	// PODGLAD OSI
+	// -----------------------------------------------------
+
+	fbCamDestack		: FB_CamAxis;
+	fbCamStack			: FB_CamAxis;
+
+	nDeStep				: INT;
+	nStStep				: INT;
+	sDePhase			: STRING(79);
+	sStPhase			: STRING(79);
+	nDeCycles			: UDINT;
+	nStCycles			: UDINT;
+
+	// -----------------------------------------------------
+	// LICZNIKI PALET
+	// -----------------------------------------------------
+	//
+	// GVL_PERSIST.St03.Mem.nRemaining  ile palet zostalo w desztaplarce razem:
+	//               na transporterze plus wiszace na szczekach
+	// GVL_PERSIST.St03.Mem.nHeld       ile wisi na szczekach desztaplarki
+	// GVL_PERSIST.St11.Mem.nHeld       ile palet liczy stos w sztaplarce
+
+
+	// -----------------------------------------------------
+	// UZGODNIENIA Z TRANSPORTEM
+	// -----------------------------------------------------
+
+	// Desztaplarka zwolnila palete - transport moze ja zabrac
+	xDe_PalletReleased	: BOOL;
+
+	// Desztaplarka pusta, cykl zamkniety na pozycji dolnej
+	xDe_Empty			: BOOL;
+
+	// Sztaplarka ma pelny stos na transporterze
+	xSt_StackReady		: BOOL;
+
+	// -----------------------------------------------------
+	// CZASOWKI OD ZALOZENIA HAMULCA
+	// -----------------------------------------------------
+	//
+	// Licza dopiero od chwili, w ktorej hamulec sie ZACISNIE -
+	// nie od wejscia w krok.
+
+	tonDeBrake			: TON;
+	tonStBrake			: TON;
+	tDeBrakeWait		: TIME;
+	tStBrakeWait		: TIME;
+
+	// Czujnik musi byc najpierw WOLNY, zeby sie zaliczyl
+	xDeArmed			: BOOL;
+	xStArmed			: BOOL;
+
+	// Stan szczek deklarowany przez KAZDY krok i przepisywany
+	// na cewki co cykl. Poleganie na tym, ze cewka zachowa
+	// wartosc miedzy krokami, juz raz nas kosztowalo prawdziwy
+	// blad - ACT_ClearCoils zeruje je w kazdym cyklu.
+	xDeJawsClosed		: BOOL;
+	xStJawsClosed		: BOOL;
+
+	// -----------------------------------------------------
+	// ZYCIE ENKODEROW
+	// -----------------------------------------------------
+	//
+	// Rosna przy KAZDEJ zmianie pozycji. Jesli silnik chodzi,
+	// a licznik stoi - enkoder nie jest podlinkowany albo nie
+	// liczy. To rozstrzyga sprawe w jednej liczbie.
+
+	nDeEncMoves			: UDINT;
+	nStEncMoves			: UDINT;
+	diDePosOld			: DINT;
+	diStPosOld			: DINT;
+
+	tonDeStep			: TON;
+	tonStStep			: TON;
+	xDeAdvance			: BOOL;
+	xStAdvance			: BOOL;
+	tDeStep				: TIME;
+	tStStep				: TIME;
+
+	// Zadanie dla osi - liczone przez maszyne stanow,
+	// podawane do bloku JEDNYM wywolaniem na cykl
+	xDeGo				: BOOL;
+	xStGo				: BOOL;
+	diDeTarget			: DINT;
+	diStTarget			: DINT;
+
+	// Wykrycie zmiany kroku. Bez tego krok zaliczylby xInPos
+	// z POPRZEDNIEJ pozycji i przeskoczyl dwa kroki naraz.
+	nDeStepOld			: INT;
+	nStStepOld			: INT;
+	xDeNewStep			: BOOL;
+	xStNewStep			: BOOL;
+	xDeAtPos			: BOOL;
+	xStAtPos			: BOOL;
+
+	rtrgDeStart			: R_TRIG;
+	rtrgStStart			: R_TRIG;
+
+	// Cewki hamulcow. TRUE = hamulec ROZLACZONY.
+	xBrakeDestack		: BOOL;
+	xBrakeStack			: BOOL;
+
+
+	// =========================================================
+	// RECZNE STEROWANIE POJEDYNCZYM SILOWNIKIEM
+	// =========================================================
+	//
+	// Do sprawdzenia okablowania bez sekwencji. Gdy nManCyl <> 0,
+	// sekwencja stoi, transportery stoja, a wybrany silownik
+	// slucha bitow ponizej.
+	//
+	//    1  st.3  szczeki desztaplarki
+	//    2  st.4  dociski gorne
+	//    3  st.4  dociski dolne
+	//    4  st.5  blokada
+	//    5  st.5  podnoszenie szczek
+	//    6  st.5  szczeki (zamkniecie / otwarcie)
+	//    7..12 st.5 silowniki rozrywajace 1..6
+	//   13  st.8  rolki podnoszone
+	//   14  st.10 rolki podnoszone
+	//   15  st.11 szczeki sztaplarki
+
+	nManCyl				: INT;
+	xManExtend			: BOOL;
+	xManRetract			: BOOL;
+
+
+	// =========================================================
+	// DOPUSZCZENIE NAPEDOW
+	// =========================================================
+	//
+	// FALSE = naped nie ruszy, chocby krok tego zadal.
+	// Ustawiane w ACT_Config, mozna zmieniac online.
+
+	axDriveEnabled		: ARRAY[1..20] OF BOOL;
+
+
+	// =========================================================
+	// KIERUNEK OBROTOW
+	// =========================================================
+	//
+	// TRUE = jazda w druga strone. Silniki stacji 1, 5, 6, 7,
+	// 8, 9, 14, 15, 16 sa podlaczone odwrotnie - do poprawy
+	// w szafie, na razie odwracamy bit.
+
+	axReverse			: ARRAY[1..20] OF BOOL;
+
+
+	// =========================================================
+	// PODGLAD
+	// =========================================================
+
+	// Gdzie jest wirtualna paleta i co sie z nia dzieje
+	nIdx				: INT;		// pozycja na trasie
+	nSub				: INT;		// krok sekwencji stacji
+	xMoving				: BOOL;		// TRUE = przejazd, FALSE = praca stacji
+	sPhase				: STRING(79);
+
+	// Ktore napedy maja teraz pracowac
+	axRunReq			: ARRAY[1..20] OF BOOL;
+
+	// Stan napedow
+	aeDrvState			: ARRAY[1..20] OF E_NordSK550P_State;
+	axDrvRunning		: ARRAY[1..20] OF BOOL;
+	alrDrvFreqAct		: ARRAY[1..20] OF LREAL;
+
+	// UWAGA - to sa DWIE ROZNE rzeczy:
+	//   axDrvFault  blad zglaszany przez falownik (bit 3 StatusWord)
+	//   axDrvError  jakakolwiek blokada: blad, brak zezwolenia
+	//               albo zerwana komunikacja
+	axDrvFault			: ARRAY[1..20] OF BOOL;
+	axDrvError			: ARRAY[1..20] OF BOOL;
+
+	// Slowa sterujace i statusowe - do czytania, co naped
+	// naprawde zglasza
+	awDrvStatus			: ARRAY[1..20] OF UINT;
+	awDrvControl		: ARRAY[1..20] OF UINT;
+
+	// Ktorykolwiek naped zglasza blad
+	xAnyDriveError		: BOOL;
+	xAnyDriveFault		: BOOL;
+
+	// Kasowanie nie poskutkowalo - blad wraca albo trzyma
+	xResetFailed		: BOOL;
+
+	// Trwa kasowanie bledow przed startem
+	xResetInProgress	: BOOL;
+	nResetTries			: INT;
+
+	// Blokada zadzialala - lancuch wymusil postoj rolek 8 i 10
+	xChainInterlock		: BOOL;
+
+	// Blokada stacji 5 kontra transporter - patrz ACT_ApplyDrives
+	xSt05_BlockLock		: BOOL;
+	tonSt05BlockDown	: TON;
+
+	// Czas biezacego kroku
+	tThisStep			: TIME;
+
+	// Licznik pelnych przebiegow trasy
+	nLoops				: UDINT;
+
+	// =========================================================
+	// LICZNIKI ZYCIA - do sprawdzenia, co sie naprawde wykonuje
+	// =========================================================
+	//
+	// nCycles     rosnie w kazdym cyklu zadania. Jesli stoi,
+	//             MAIN sie nie wykonuje albo wysypal sie wczesniej.
+	// nOutWrites  rosnie za kazdym przepisaniem cewek na wyjscia.
+	//             Jesli nCycles rosnie, a nOutWrites stoi -
+	//             program nie dochodzi do ACT_Outputs.
+	// nCoilsOn    ile cewek jest w tej chwili podanych. Jesli
+	//             rosnie i spada, a nic sie nie rusza - sygnal
+	//             nie dochodzi do zaworu.
+
+	nCycles				: UDINT;
+	nOutWrites			: UDINT;
+	nCoilsOn			: INT;
+
+
+	// =========================================================
+	// CEWKI ZAWOROW
+	// =========================================================
+	//
+	// Stan trzymany miedzy cyklami. ACT_Outputs przepisuje go
+	// na wyjscia - mapowanie jest TAM i tylko tam.
+
+	// Stacja 3 - szczeki desztaplarki
+	xSt03_JawClose		: BOOL;
+	xSt03_JawOpen		: BOOL;
+
+	// Stacja 4 - dociski. Obie grupy gornych chodza razem.
+	xSt04_UpExt			: BOOL;
+	xSt04_UpRet			: BOOL;
+	xSt04_LoExt			: BOOL;
+	xSt04_LoRet			: BOOL;
+
+	// Stacja 5
+	xSt05_BlockExt		: BOOL;		// blokada wysuw
+	xSt05_BlockRet		: BOOL;		// blokada opuszczenie
+	xSt05_LiftUp		: BOOL;		// szczeki w gore
+	xSt05_LiftDown		: BOOL;		// szczeki w dol
+	xSt05_JawClose		: BOOL;		// trzy pary szczek razem
+	axSt05_PullUp		: ARRAY[1..6] OF BOOL;
+	axSt05_PullDown		: ARRAY[1..6] OF BOOL;
+
+	// Rolki podnoszone
+	xSt08_Up			: BOOL;
+	xSt08_Down			: BOOL;
+	xSt10_Up			: BOOL;
+	xSt10_Down			: BOOL;
+
+	// Stacja 11 - szczeki sztaplarki
+	xSt11_JawClose		: BOOL;
+	xSt11_JawOpen		: BOOL;
+
+
+	// =========================================================
+	// NAPEDY
+	// =========================================================
+
+	fbNord				: ARRAY[1..20] OF FB_NordSK550PP;
+
+
+	// =========================================================
+	// OBSERWATOR STANU - LOG CSV NA DYSKU STEROWNIKA
+	// =========================================================
+	//
+	// Co tLogPeriod jeden wiersz z kluczowymi zmiennymi, a do
+	// tego wiersz na kazde ZDARZENIE: zmiana numeru kroku,
+	// czujnika, zadania napedu, bledu falownika, bitu operatora,
+	// szczek, skok enkodera. Najwyzej jeden wiersz na cykl.
+	//
+	// Nowy plik: start PLC, RESET_CYCLE, zbocze xLogNewFile.
+	// Katalog MUSI istniec na sterowniku: fbLog.sDir
+	// (domyslnie C:\TesterPalet\log\). Nazwa pliku w fbLog.sFileName.
+	//
+	// Logger tylko CZYTA zmienne procesu - ACT_Logger idzie jako
+	// ostatnia akcja cyklu, po ACT_Outputs, zeby w pliku bylo to,
+	// co naprawde poszlo na wyjscia.
+
+	fbLog				: FB_CsvLogger;
+
+	// FALSE = nie zbieramy wierszy (plik zostaje, nic sie nie psuje)
+	xLogEnable			: BOOL := TRUE;
+
+	// Zbocze = nowy plik bez resetu cyklu. Sam sie zdejmuje.
+	xLogNewFile			: BOOL;
+
+	// Takt wiersza okresowego
+	tLogPeriod			: TIME := T#1S;
+	tonLog				: TON;
+
+	// Skok enkodera w jednym cyklu, od ktorego piszemy zdarzenie
+	diLogEncJump		: DINT := 2000;
+
+	// Powod biezacego wiersza - do kolumny "why"
+	sLogWhy				: STRING(79);
+	xLogEvent			: BOOL;
+	nLogRows			: UDINT;
+
+	// Pamiec do wykrywania zdarzen
+	xLogInit			: BOOL;
+	anLogStepOld		: ARRAY[1..6] OF INT;
+	axLogInOld			: ARRAY[1..10] OF BOOL;
+	axLogReqOld			: ARRAY[1..20] OF BOOL;
+	axLogFaultOld		: ARRAY[1..20] OF BOOL;
+	axLogBitOld			: ARRAY[1..24] OF BOOL;
+	axLogBit			: ARRAY[1..24] OF BOOL;
+
+	// Robocze do skladania nazw kolumn napedow
+	sLogPfx				: STRING(15);
+	wLogFesto1			: WORD;
+	wLogFesto2			: WORD;
+	nLogI				: INT;
+	nLogJ				: INT;
+
+
+	// =========================================================
+	// WEWNETRZNE
+	// =========================================================
+
+	xInit				: BOOL;
+	i					: INT;
+	lrThisFreq			: LREAL;
+	tonStep				: TON;
+	tonResetGap			: TON;
+	xAdvance			: BOOL;
+	rtrgStart			: R_TRIG;
+	rtrgResetDrv		: R_TRIG;
+	rtrgStack			: R_TRIG;
+	xDoResetPulse		: BOOL;
+	axRunOld			: ARRAY[1..20] OF BOOL;
+
+	// Krok zglasza tu, ze czeka na czujnik i ktory to czujnik.
+	// Kasowane co cykl, ustawiane przez sam krok.
+	xWaitSensor			: BOOL;
+	xSensorOK			: BOOL;
+
+	// Czujnik musi najpierw byc WOLNY. Bez tego zaliczylby sie
+	// stan sprzed kroku albo czujnik zawieszony na stale.
+	xStepArmed			: BOOL;
+
+	// Wykrycie zmiany kroku - czasowka i uzbrojenie od zera
+	xNewStep			: BOOL;
+	nIdxOld				: INT;
+	nSubOld				: INT;
+	xMovingOld			: BOOL;
+
+	// TRUE = przejazd ma jeszcze kroki wewnetrzne, nIdx zostaje
+	xHoldIdx			: BOOL;
+
+END_VAR
+VAR CONSTANT
+
+	// P105 falownikow
+	cFmax				: LREAL := 50.0;
+
+	// Liczba falownikow zmapowanych w .tsproj
+	cNumDrives			: INT := 19;
+
+	// Liczba pozycji na trasie
+	cLastIdx			: INT := 16;
+
+	// Ile razy probujemy skasowac blad przed startem
+	cResetTries			: INT := 3;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// MAIN - TEST RUCHU TRANSPORTEROW
+// =============================================================
+
+// Puls zycia - jesli ten licznik stoi, MAIN sie nie wykonuje
+nCycles := nCycles + 1;
+
+ACT_Config();
+
+ACT_Inputs();
+
+ACT_Sequence();
+
+// Krzywki chodza NIEZALEZNIE od START_TEST i po ACT_Sequence,
+// zeby ich szczeki mialy pierwszenstwo przed sekwencja linii.
+ACT_CamCycles();
+
+// Transport proby calosciowej - po krzywkach, zeby jego
+// cewki i zadania napedow mialy pierwszenstwo.
+ACT_TestFeed();
+
+ACT_ResetDrives();
+
+ACT_ApplyDrives();
+
+ACT_Drives();
+
+ACT_Outputs();
+
+// Obserwator stanu - OSTATNI, zeby logowal to, co poszlo na wyjscia
+ACT_Logger();
+]]></ST>
+    </Implementation>
+    <Action Name="ACT_ApplyDrives" Id="{4a10e003-0000-4000-9000-00000000e003}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_ApplyDrives
+// Zadanie ruchu -> metody falownikow
+// =============================================================
+//
+// Metody wolamy NA ZBOCZU. Blok napedu przy blokadzie sam kasuje
+// zadanie ruchu i naped nie moze ruszyc sam po ustapieniu
+// przyczyny - wolanie M_Start co cykl zepsuloby to zabezpieczenie.
+
+xAnyDriveError := FALSE;
+
+
+// -------------------------------------------------------------
+// BLOKADA: LANCUCH KONTRA ROLKI STACJI 8 I 10
+// -------------------------------------------------------------
+//
+// Gdy jedzie transporter lancuchowy, rolki stacji 8 i 10 sa
+// opuszczone i paleta lezy na lancuchu. Krecenie nimi w tym
+// czasie szarpaloby palete z dwoch stron naraz.
+//
+// To nie jest poprawka tabeli krokow, tylko warunek nadrzedny -
+// zadziala takze wtedy, gdy ktos pozniej zmieni tabele.
+
+xChainInterlock := FALSE;
+
+IF axRunReq[7] THEN
+
+	IF axRunReq[12] OR axRunReq[16] THEN
+		xChainInterlock := TRUE;
+	END_IF
+
+	axRunReq[12] := FALSE;		// rolki stacji 8
+	axRunReq[16] := FALSE;		// rolki stacji 10
+
+END_IF
+
+
+// -------------------------------------------------------------
+// BLOKADA STACJI 5 KONTRA TRANSPORTER
+// -------------------------------------------------------------
+//
+// Wysunieta blokada znaczy "paleta ma tu stanac". Wypychanie jej
+// wtedy na stacje 6 to praca transportera w zapore - i to jest
+// przyczyna, dla ktorej naped 5 wchodzil w przeciazenie.
+//
+// WJAZD ZE STACJI 4 JEST WYJATKIEM: tam blokada MA byc wysunieta,
+// bo to ona zatrzymuje palete. Dlatego warunek dotyczy wylacznie
+// jazdy W STRONE STACJI 6, czyli kroku 180 toru B1.
+//
+// Blokada nie ma czujnika polozenia, wiec zadamy nie tylko
+// zdjetej komendy, ale i tCylTime na jej faktyczne opuszczenie.
+// Warunek nadrzedny, jak blokada lancucha wyzej - nie zalezy od
+// tabeli krokow i zadziala takze po jej zmianie.
+
+xSt05_BlockLock := FALSE;
+
+IF (nOutStep = 180) AND NOT tonSt05BlockDown.Q THEN
+	xSt05_BlockLock := TRUE;
+	axRunReq[5] := FALSE;
+	axRunReq[6] := FALSE;
+END_IF
+
+
+// -------------------------------------------------------------
+// SPRZEZENIE: ROLKI DOCISKOWE STACJI 4 Z TRANSPORTEREM
+// -------------------------------------------------------------
+//
+// Naped 3 (gorne rolki dociskowe) kreci sie zawsze wtedy, gdy
+// kreci sie transporter stacji 4 (naped 4). Nie ma sensu, zeby
+// rolki lezaly na deskach i staly, kiedy paleta pod nimi jedzie.
+//
+// Warunek nadrzedny, tak jak blokada lancucha wyzej: nie zalezy
+// od tabeli krokow i zadziala takze po jej zmianie.
+//
+// Kierunek bierzemy z bitu, ktory mozna przestawic online.
+
+axReverse[3] := xSt04_RollRev;
+
+IF axRunReq[4] THEN
+	axRunReq[3] := TRUE;
+END_IF
+
+
+FOR i := 1 TO cNumDrives DO
+
+	// Naped niedopuszczony nie ruszy, chocby krok tego zadal
+	IF NOT axDriveEnabled[i] THEN
+		axRunReq[i] := FALSE;
+	END_IF
+
+	IF axDrvError[i] THEN
+		xAnyDriveError := TRUE;
+	END_IF
+
+
+
+	// Czestotliwosc: wlasna dla napedu, inaczej bazowa.
+	lrThisFreq := lrTestFreq;
+
+	IF alrDriveFreq[i] > 0.0 THEN
+		lrThisFreq := alrDriveFreq[i];
+	END_IF
+
+	// Krzywki maja wlasna nastawe i wygrywaja z tablica
+	IF (i = 1) OR (i = 2) THEN
+		lrThisFreq := lrCamFreq;
+	END_IF
+
+	// Naped zablokowany (blad, brak zezwolenia, zerwana
+	// komunikacja) SAM kasuje u siebie zadanie ruchu - i slusznie,
+	// bo nie wolno mu ruszyc samoczynnie po ustapieniu przyczyny.
+	//
+	// Warstwa maszyny musi wiec wydac komende OD NOWA. Dlatego:
+	//   - w czasie blokady nie wolamy M_Start (byloby bez sensu,
+	//     a lamaloby regule wolania na zboczu),
+	//   - pamiec zbocza trzymamy wtedy wyzerowana, zeby po
+	//     ustapieniu przyczyny powstalo JEDNO nowe zbocze.
+	//
+	// Bez tego naped, ktory raz wpadl w blad, stalby juz na
+	// zawsze - skasowanie bledu nic by nie dalo, bo zbocze
+	// startu dawno minelo.
+
+	IF axRunReq[i] AND NOT axRunOld[i] AND NOT axDrvError[i] THEN
+		fbNord[i].M_Start(lrFreq := lrThisFreq, xReverse := axReverse[i]);
+	END_IF
+
+	IF NOT axRunReq[i] AND axRunOld[i] THEN
+		fbNord[i].M_Stop();
+	END_IF
+
+	axRunOld[i] := axRunReq[i] AND NOT axDrvError[i];
+
+END_FOR
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_CamCycles" Id="{4a10e011-0000-4000-9000-000000000011}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_CamCycles
+// Desztaplarka (st.3) i sztaplarka (st.11)
+// =============================================================
+//
+// KORBA JEDZIE ZAWSZE W JEDNA STRONE. Cykl to jeden obrot:
+// dol -> posrednia -> gorna -> DALEJ TYM SAMYM KIERUNKIEM
+// z powrotem na dol. Nigdy nie wracamy tam, skad przyjechalismy.
+//
+// Enkoder jest jednoobrotowy i potrafi pokazac wartosc wieksza
+// niz jeden obrot, wiec FB_CamAxis sprowadza ja modulo 65536,
+// liczy przyrost ze znakiem i sam wykrywa przejscia przez zero.
+// Tutaj operujemy juz tylko pozycjami 0..65535.
+//
+// REGULA NADRZEDNA obu maszyn: nic w szczekach = szczeki
+// OTWARTE i jazda na pozycje DOLNA, niezaleznie od tego, gdzie
+// wozek stoi.
+//
+// -------------------------------------------------------------
+// SZCZEKI
+// -------------------------------------------------------------
+// KAZDY krok deklaruje xDeJawsClosed / xStJawsClosed, a cewki
+// przepisujemy raz, na koncu akcji. Nie wolno polegac na tym,
+// ze cewka zachowa wartosc miedzy krokami - ACT_ClearCoils
+// zeruje wszystkie cewki w kazdym cyklu przy zdjetym START_TEST,
+// wiec krok, ktory ich nie odswieza, traci sterowanie zaworem.
+//
+// -------------------------------------------------------------
+// SYGNALY
+// -------------------------------------------------------------
+//   xPal_St03     IN2   sztapla na stacji 3
+//   xPal_St04In   IN3   stacja 4 przyjela palete
+//   xPal_St11     IN8   paleta na stacji 11
+//
+// Czujnik musi byc najpierw WOLNY, zeby sie zaliczyl.
+
+
+// =============================================================
+// RESET CYKLU DO ZERA
+// =============================================================
+//
+// Wykonujemy to PRZED maszynami stanow, zeby jeszcze w tym
+// samym cyklu ruszyly juz od kroku 0 - takze transport,
+// bo ACT_TestFeed idzie po tej akcji.
+
+rtrgResetCycle(CLK := RESET_CYCLE);
+
+IF rtrgResetCycle.Q THEN
+
+	nDeStep   := 0;
+	nStStep   := 0;
+	nFeedStep := 0;
+	nOutStep  := 0;
+	nOut2Step := 0;
+	nOut3Step := 0;
+
+	xOutStart  := FALSE;
+	xOut2Start := FALSE;
+	xOut3Start := FALSE;
+	xSt08_RollDown  := FALSE;
+	xSt08_AtStation := FALSE;
+
+	xSt05_Done := FALSE;
+
+	GVL_PERSIST.St03.Mem.nRemaining := 0;
+	GVL_PERSIST.St03.Mem.nHeld      := 0;
+	GVL_PERSIST.St11.Mem.nHeld      := 0;
+
+	xDe_PalletReleased := FALSE;
+	xSt_StackReady     := FALSE;
+	xSt01_StackReady   := FALSE;
+
+	nFeedPallets := 0;
+	nDeCycles    := 0;
+	nStCycles    := 0;
+
+	RESET_CYCLE := FALSE;
+
+END_IF
+
+
+// =============================================================
+// KONTROLA NASTAW POZYCJI
+// =============================================================
+//
+// Trzy punkty musza byc od siebie oddalone o co najmniej
+// diCamMinSpan, liczac najkrotsza droga po okregu. Zerowe
+// nastawy - na przyklad po skasowaniu danych nieulotnych -
+// znacza, ze kazdy krok od razu melduje "na pozycji", a szczeki
+// zamykaja sie tam, gdzie wozek akurat stoi.
+
+xDeCfgOK := TRUE;
+
+diTmp := GVL_PERSIST.St03.Cfg.diPosMiddle - GVL_PERSIST.St03.Cfg.diPosBottom;
+IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+IF ABS(diTmp) < diCamMinSpan THEN xDeCfgOK := FALSE; END_IF
+
+diTmp := GVL_PERSIST.St03.Cfg.diPosTop - GVL_PERSIST.St03.Cfg.diPosBottom;
+IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+IF ABS(diTmp) < diCamMinSpan THEN xDeCfgOK := FALSE; END_IF
+
+diTmp := GVL_PERSIST.St03.Cfg.diPosTop - GVL_PERSIST.St03.Cfg.diPosMiddle;
+IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+IF ABS(diTmp) < diCamMinSpan THEN xDeCfgOK := FALSE; END_IF
+
+
+xStCfgOK := TRUE;
+
+diTmp := GVL_PERSIST.St11.Cfg.diPosMiddle - GVL_PERSIST.St11.Cfg.diPosBottom;
+IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+IF ABS(diTmp) < diCamMinSpan THEN xStCfgOK := FALSE; END_IF
+
+diTmp := GVL_PERSIST.St11.Cfg.diPosTop - GVL_PERSIST.St11.Cfg.diPosBottom;
+IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+IF ABS(diTmp) < diCamMinSpan THEN xStCfgOK := FALSE; END_IF
+
+diTmp := GVL_PERSIST.St11.Cfg.diPosTop - GVL_PERSIST.St11.Cfg.diPosMiddle;
+IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+IF ABS(diTmp) < diCamMinSpan THEN xStCfgOK := FALSE; END_IF
+
+
+// =============================================================
+// ZMIANA KROKU
+// =============================================================
+//
+// Blok osi liczy xInPos wzgledem celu z POPRZEDNIEGO cyklu,
+// wiec w pierwszym cyklu nowego kroku tej informacji nie
+// zaliczamy - inaczej krok przeskoczylby dwa naraz.
+
+// =============================================================
+// KONTROLA ENKODERA PO STARCIE
+// =============================================================
+//
+// Raz, w pierwszym cyklu po starcie PLC. Porownujemy odczyt
+// z wartoscia zapamietana przed wylaczeniem. Roznica wieksza
+// niz diEncCheckTol znaczy, ze enkoder NIE utrzymal pozycji
+// i trzeba go zbazowac na dole.
+
+IF NOT xEncCheckDone THEN
+
+	xEncCheckDone := TRUE;
+
+	diTmp := fbCamDestack.diPos - GVL_PERSIST.St03.Mem.diLastPos;
+	IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+	IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+	diDeEncJump := diTmp;
+
+	diTmp := fbCamStack.diPos - GVL_PERSIST.St11.Mem.diLastPos;
+	IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+	IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+	diStEncJump := diTmp;
+
+	GVL_PERSIST.St03.Mem.xNeedHoming := ABS(diDeEncJump) > diEncCheckTol;
+	GVL_PERSIST.St11.Mem.xNeedHoming := ABS(diStEncJump) > diEncCheckTol;
+
+	sEncCheck := 'enkodery utrzymaly pozycje - bazowanie zbedne';
+
+	IF GVL_PERSIST.St03.Mem.xNeedHoming THEN
+		sEncCheck := 'DESZTAPLARKA - enkoder nie utrzymal pozycji, zbazuj dol';
+	END_IF
+
+	IF GVL_PERSIST.St11.Mem.xNeedHoming THEN
+		sEncCheck := 'SZTAPLARKA - enkoder nie utrzymal pozycji, zbazuj dol';
+	END_IF
+
+END_IF
+
+
+// Zapamietanie biezacej pozycji na wypadek zaniku zasilania.
+// PLC ma 1 s UPSa, wiec TwinCAT zdazy zapisac dane nieulotne.
+GVL_PERSIST.St03.Mem.diLastPos := fbCamDestack.diPos;
+GVL_PERSIST.St11.Mem.diLastPos := fbCamStack.diPos;
+
+
+// Impulsy ustawienia punktu odniesienia - kasowane co cykl
+xDeSetAccum := FALSE;
+xStSetAccum := FALSE;
+
+
+xDeNewStep := (nDeStep <> nDeStepOld);
+xStNewStep := (nStStep <> nStStepOld);
+
+nDeStepOld := nDeStep;
+nStStepOld := nStStep;
+
+IF xDeNewStep THEN
+	tonDeStep(IN := FALSE);
+	xDeArmed := FALSE;
+END_IF
+
+IF xStNewStep THEN
+	tonStStep(IN := FALSE);
+	xStArmed := FALSE;
+END_IF
+
+tonDeStep(IN := TRUE, PT := tDeStep);
+tonStStep(IN := TRUE, PT := tStStep);
+
+xDeAdvance := tonDeStep.Q AND NOT xDeNewStep;
+xStAdvance := tonStStep.Q AND NOT xStNewStep;
+
+xDeAtPos := fbCamDestack.xInPos AND NOT xDeNewStep;
+xStAtPos := fbCamStack.xInPos   AND NOT xStNewStep;
+
+
+// Czasowki liczone od ZACISNIECIA hamulca, nie od wejscia w krok
+tonDeBrake(IN := NOT fbCamDestack.xBrakeRelease, PT := tDeBrakeWait);
+tonStBrake(IN := NOT fbCamStack.xBrakeRelease,   PT := tStBrakeWait);
+
+
+// =============================================================
+// DESZTAPLARKA - STACJA 3
+// =============================================================
+//
+//   0   dom: szczeki otwarte, jazda na dol
+//   10  czekam na sztaple
+//   20  jazda na pozycje posrednia, szczeki OTWARTE
+//   30  hamulec zalozony, odliczam 1 s
+//   40  szczeki zamykaja sie pod druga paleta od dolu
+//   50  jazda na gore - stos uniesiony przez druga palete
+//   60  info do transportu, czekam az stacja 4 przyjmie palete
+//   70  DALEJ tym samym kierunkiem, dopelnienie obrotu na dol
+//   80  hamulec zalozony, szczeki otwieraja sie
+//   85  BRAMKA CYKLU - na dole czekam na koniec cyklu stacji 5
+//   90  ostatnia paleta - nie ma czego chwytac, wyjezdza sama
+
+xDeJog := (JOG_DESTACK_FWD OR JOG_DESTACK_REV) AND NOT START_DESTACK;
+
+rtrgDeStart(CLK := START_DESTACK);
+
+IF rtrgDeStart.Q THEN
+	nDeStep := 0;
+END_IF
+
+IF rtrgDeStart.Q AND xAutoResetOnStart AND xAnyDriveFault THEN
+	xResetInProgress := TRUE;
+	nResetTries      := 0;
+	xResetFailed     := FALSE;
+END_IF
+
+xDeGo        := FALSE;
+tDeStep      := tJawTime;
+tDeBrakeWait := tDeGripDelay;
+
+
+// REGULA NADRZEDNA: pusto w szczekach w kroku niosacym stos
+// to sprzecznosc - wracamy do domu zamiast jechac dalej.
+IF (GVL_PERSIST.St03.Mem.nHeld <= 0) AND (nDeStep >= 50) AND (nDeStep <= 70) THEN
+	nDeStep := 0;
+END_IF
+
+
+IF NOT START_DESTACK THEN
+	sDePhase := 'DESZTAPLARKA - stop, START_DESTACK = FALSE';
+END_IF
+
+IF xDeJog THEN
+	sDePhase := 'DESZT. RECZNIE - jazda krzywka, patrz na diPos';
+END_IF
+
+IF START_DESTACK AND fbCamDestack.xBrakeWait THEN
+	sDePhase := 'DESZT. czekam na odpuszczenie hamulca przed startem';
+END_IF
+
+IF START_DESTACK AND fbCamDestack.xStall THEN
+	sDePhase := 'DESZT. CZUWAK - falownik pracuje, a enkoder nie liczy';
+END_IF
+
+IF START_DESTACK AND fbCamDestack.xNoDrvAck THEN
+	sDePhase := 'DESZT. CZUWAK - falownik 1 nie potwierdza pracy';
+END_IF
+
+IF START_DESTACK AND fbCamDestack.xStall AND axDrvFault[1] THEN
+	sDePhase := 'DESZT. CZUWAK - falownik 1 w bledzie, kasuj xCmdResetDrives';
+END_IF
+
+IF START_DESTACK AND fbCamDestack.xStall AND NOT axDriveEnabled[1] THEN
+	sDePhase := 'DESZT. CZUWAK - naped 1 NIEDOPUSZCZONY, ACT_Config sie nie wykonalo';
+END_IF
+
+
+IF START_DESTACK AND NOT xDeCfgOK THEN
+	sDePhase := 'DESZT. NASTAWY POZYCJI PUSTE albo BLEDNE - naucz dol/srodek/gore';
+END_IF
+
+
+IF START_DESTACK AND NOT fbCamDestack.xStall AND xDeCfgOK THEN
+
+	CASE nDeStep OF
+
+	0:
+		// REGULA NADRZEDNA: nic w szczekach = otwarte i na dol.
+		//
+		// Szczeki otwieramy OD RAZU, takze na gorze. Swiadomy
+		// wybor: przy 1000 Nm na krzywce gorsza awaria jest
+		// przeciagniecie zamknietych szczek przez stos niz
+		// spadniecie palet. NIE dodawac tu zjazdu "trzymajac"
+		// bez rozmowy - bylo zrobione i zostalo cofniete.
+		sDePhase := 'DESZT. 0 dom: szczeki otwarte, jazda na dol';
+		xDeJawsClosed := FALSE;
+		GVL_PERSIST.St03.Mem.nHeld    := 0;
+		xDeGo       := TRUE;
+		diDeGoToEnc := GVL_PERSIST.St03.Cfg.diPosBottom;
+		IF xDeAtPos THEN nDeStep := 10; END_IF
+
+	10:
+		sDePhase := 'DESZT. 1 czekam na sztaple na stacji 3 (IN2)';
+		xDeJawsClosed := FALSE;
+		xDe_Empty := TRUE;
+
+		// Sztapla, ktora JUZ stoi na stacji przy wejsciu w krok,
+		// jest sztapla gotowa do pracy - nie kazemy jej zjezdzac
+		// i wracac. Uzbrojenie chroni tylko przed policzeniem
+		// tej samej sztapli dwa razy w trakcie czekania.
+		IF xDeNewStep AND xPal_St03 THEN xDeArmed := TRUE; END_IF
+
+		IF NOT xPal_St03 THEN xDeArmed := TRUE; END_IF
+
+		IF xDeArmed AND xPal_St03 THEN
+			GVL_PERSIST.St03.Mem.nRemaining := GVL_PERSIST.St03.Cfg.nStackSize;
+			xDe_Empty    := FALSE;
+			nDeStep      := 20;
+		END_IF
+
+	20:
+		sDePhase := 'DESZT. 2 jazda na pozycje posrednia, szczeki otwarte';
+		xDeJawsClosed := FALSE;
+		xDeGo       := TRUE;
+		diDeGoToEnc := GVL_PERSIST.St03.Cfg.diPosMiddle;
+		IF xDeAtPos THEN nDeStep := 30; END_IF
+
+	30:
+		sDePhase := 'DESZT. 3 hamulec zalozony - odliczam przed chwytem';
+		xDeJawsClosed := FALSE;
+		IF tonDeBrake.Q THEN nDeStep := 40; END_IF
+
+	40:
+		sDePhase := 'DESZT. 4 szczeki chwytaja 2. palete od dolu';
+		xDeJawsClosed := TRUE;
+		IF xDeAdvance THEN
+			GVL_PERSIST.St03.Mem.nHeld := GVL_PERSIST.St03.Mem.nRemaining - 1;
+			nDeStep := 50;
+		END_IF
+
+	50:
+		sDePhase := 'DESZT. 5 jazda na gore - stos uniesiony';
+		xDeJawsClosed := TRUE;
+		xDeGo       := TRUE;
+		diDeGoToEnc := GVL_PERSIST.St03.Cfg.diPosTop;
+		IF xDeAtPos THEN nDeStep := 60; END_IF
+
+	60:
+		// Potwierdzeniem odbioru jest czujnik na KONCU stacji 4
+		// (IN4), a nie ten od wjazdu pod rolki. Dopiero on mowi,
+		// ze paleta naprawde zjechala z desztaplarki.
+		//
+		// TEN WARUNEK MUSI BYC KROTKI. Stos wisi tu na szczekach,
+		// wiec nie wolno w tym kroku czekac na nic dalszego niz
+		// zjazd palety z desztaplarki - bramka cyklu stoi w
+		// kroku 85, na dole, przy stosie opartym o transporter.
+		//
+		// IN4 pilnuje takze tego, zeby stos nie zjechal na palete,
+		// ktora jeszcze nie zdazyla wyjechac.
+		sDePhase := 'DESZT. 6 paleta zwolniona - czekam na koniec st.4 (IN4)';
+		xDeJawsClosed := TRUE;
+		xDe_PalletReleased := TRUE;
+
+		IF NOT xPal_St04End THEN xDeArmed := TRUE; END_IF
+
+		IF xPal_St04End AND NOT xDeArmed THEN
+			sDePhase := 'DESZT. 6 IN4 JUZ zaslonony - odslon i zaslon ponownie';
+		END_IF
+
+		IF xDeArmed AND xPal_St04End THEN
+			GVL_PERSIST.St03.Mem.nRemaining       := GVL_PERSIST.St03.Mem.nRemaining - 1;
+			xDe_PalletReleased := FALSE;
+			nDeStep            := 70;
+		END_IF
+
+	70:
+		// DALEJ tym samym kierunkiem - dopelnienie pelnego obrotu
+		sDePhase := 'DESZT. 7 dopelnienie obrotu - zjazd stosu na dol';
+		xDeJawsClosed := TRUE;
+		xDeGo       := TRUE;
+		diDeGoToEnc := GVL_PERSIST.St03.Cfg.diPosBottom;
+		IF xDeAtPos THEN nDeStep := 80; END_IF
+
+	80:
+		sDePhase := 'DESZT. 8 hamulec zalozony - szczeki otwieraja sie';
+		tDeBrakeWait := tJawTime;
+		GVL_PERSIST.St03.Mem.nHeld := 0;
+
+		xDeJawsClosed := TRUE;
+
+		IF NOT fbCamDestack.xBrakeRelease THEN
+			xDeJawsClosed := FALSE;
+		END_IF
+
+		IF tonDeBrake.Q AND (GVL_PERSIST.St03.Mem.nRemaining > 1) THEN
+			nDeCycles := nDeCycles + 1;
+			nDeStep   := 85;
+		END_IF
+
+		IF tonDeBrake.Q AND (GVL_PERSIST.St03.Mem.nRemaining = 1) THEN
+			nDeCycles := nDeCycles + 1;
+			nDeStep   := 90;
+		END_IF
+
+		IF tonDeBrake.Q AND (GVL_PERSIST.St03.Mem.nRemaining <= 0) THEN
+			nDeStep := 0;
+		END_IF
+
+	85:
+		// BRAMKA CYKLU - JEDYNE DLUGIE CZEKANIE DESZTAPLARKI.
+		//
+		// Stoi TU, a nie na gorze w kroku 60, i to jest istota
+		// sprawy: wozek jest na dole, stos oparty o transporter,
+		// szczeki otwarte, hamulec zalozony. Nic nie wisi.
+		//
+		// Wczesniej ta bramka stala w kroku 60 i stos zostawal
+		// zawieszony na szczekach przez caly cykl stacji 5 -
+		// dziesiatki sekund zamiast kilku. Tak stracilismy stos.
+		//
+		// Czekamy na koniec cyklu stacji 5: dopiero wtedy ma sens
+		// wydawac kolejna palete, bo poprzednia zjechala juz
+		// w strone stacji 16.
+		sDePhase := 'DESZT. 8b stos na dole - czekam na koniec cyklu st.5';
+		xDeJawsClosed := FALSE;
+
+		IF xSt05_Done THEN
+			xSt05_Done := FALSE;
+			nDeStep    := 20;
+		END_IF
+
+	90:
+		// Ostatnia paleta lezy wprost na transporterze - szczeki
+		// nie maja pod co wejsc, wiec wyjezdza sama.
+		sDePhase := 'DESZT. 9 ostatnia paleta - wyjezdza sama, bez chwytu';
+		xDeJawsClosed := FALSE;
+		xDe_PalletReleased := TRUE;
+
+		IF NOT xPal_St04End THEN xDeArmed := TRUE; END_IF
+
+		IF xPal_St04End AND NOT xDeArmed THEN
+			sDePhase := 'DESZT. 9 IN4 JUZ zaslonony - odslon i zaslon ponownie';
+		END_IF
+
+		IF xDeArmed AND xPal_St04End THEN
+			GVL_PERSIST.St03.Mem.nRemaining       := 0;
+			xDe_PalletReleased := FALSE;
+			nDeCycles          := nDeCycles + 1;
+			nDeStep            := 0;
+		END_IF
+
+	END_CASE
+
+END_IF
+
+
+// =============================================================
+// SZTAPLARKA - STACJA 11
+// =============================================================
+//
+//   0   dom: szczeki otwarte, jazda na dol
+//   10  czekam na pierwsza palete
+//   20  hamulec zalozony, odliczam 1 s
+//   25  szczeki chwytaja palete
+//   30  jazda na gore - miejsce na nastepna palete
+//   40  czekam na nowa palete
+//   50  zjazd na srodek - stos siada na nowej palecie
+//   60  hamulec zalozony, szczeki otwieraja sie
+//   70  stos pelny - czekam, az zjedzie
+//   80  jazda na dol pod caly stos
+//   90  hamulec zalozony, odliczam 1 s
+//   95  szczeki chwytaja stos od spodu
+
+xStJog := (JOG_STACK_FWD OR JOG_STACK_REV) AND NOT START_STACK;
+
+rtrgStStart(CLK := START_STACK);
+
+IF rtrgStStart.Q THEN
+	nStStep := 0;
+END_IF
+
+xStGo        := FALSE;
+tStStep      := tJawTime;
+tStBrakeWait := tDeGripDelay;
+
+
+IF NOT START_STACK THEN
+	sStPhase := 'SZTAPLARKA - stop, START_STACK = FALSE';
+END_IF
+
+IF xStJog THEN
+	sStPhase := 'SZTAPL. RECZNIE - jazda krzywka, patrz na diPos';
+END_IF
+
+IF START_STACK AND fbCamStack.xBrakeWait THEN
+	sStPhase := 'SZTAPL. czekam na odpuszczenie hamulca przed startem';
+END_IF
+
+IF START_STACK AND fbCamStack.xStall THEN
+	sStPhase := 'SZTAPL. CZUWAK - falownik pracuje, a enkoder nie liczy';
+END_IF
+
+IF START_STACK AND fbCamStack.xNoDrvAck THEN
+	sStPhase := 'SZTAPL. CZUWAK - falownik 2 nie potwierdza pracy';
+END_IF
+
+IF START_STACK AND fbCamStack.xStall AND axDrvFault[2] THEN
+	sStPhase := 'SZTAPL. CZUWAK - falownik 2 w bledzie, kasuj xCmdResetDrives';
+END_IF
+
+IF START_STACK AND fbCamStack.xStall AND NOT axDriveEnabled[2] THEN
+	sStPhase := 'SZTAPL. CZUWAK - naped 2 NIEDOPUSZCZONY, ACT_Config sie nie wykonalo';
+END_IF
+
+
+IF START_STACK AND NOT xStCfgOK THEN
+	sStPhase := 'SZTAPL. NASTAWY POZYCJI PUSTE albo BLEDNE - naucz dol/srodek/gore';
+END_IF
+
+
+IF START_STACK AND NOT fbCamStack.xStall AND xStCfgOK THEN
+
+	CASE nStStep OF
+
+	0:
+		// Szczeki otwarte od razu - patrz komentarz w kroku 0
+		// desztaplarki. Swiadomy wybor.
+		sStPhase := 'SZTAPL. 0 dom: szczeki otwarte, jazda na dol';
+		xStJawsClosed := FALSE;
+		GVL_PERSIST.St11.Mem.nHeld    := 0;
+		xStGo       := TRUE;
+		diStGoToEnc := GVL_PERSIST.St11.Cfg.diPosBottom;
+		IF xStAtPos THEN nStStep := 10; END_IF
+
+	10:
+		sStPhase := 'SZTAPL. 1 czekam na pierwsza palete (IN8)';
+		xStJawsClosed := FALSE;
+
+		IF NOT xPal_St11 THEN xStArmed := TRUE; END_IF
+
+		IF xPal_St11 AND NOT xStArmed THEN
+			sStPhase := 'SZTAPL. 1 IN8 JUZ zaslonony - odslon i zaslon ponownie';
+		END_IF
+
+		IF xStArmed AND xPal_St11 THEN nStStep := 20; END_IF
+
+	20:
+		sStPhase := 'SZTAPL. 2 hamulec zalozony - odliczam przed chwytem';
+		xStJawsClosed := FALSE;
+		IF tonStBrake.Q THEN nStStep := 25; END_IF
+
+	25:
+		sStPhase := 'SZTAPL. 2b szczeki chwytaja palete';
+		xStJawsClosed := TRUE;
+		IF xStAdvance THEN
+			GVL_PERSIST.St11.Mem.nHeld := 1;
+			nStStep := 30;
+		END_IF
+
+	30:
+		sStPhase := 'SZTAPL. 3 jazda na gore - miejsce na nowa palete';
+		xStJawsClosed := TRUE;
+		xStGo       := TRUE;
+		diStGoToEnc := GVL_PERSIST.St11.Cfg.diPosTop;
+		IF xStAtPos THEN nStStep := 40; END_IF
+
+	40:
+		sStPhase := 'SZTAPL. 4 czekam na nowa palete (IN8)';
+		xStJawsClosed := TRUE;
+
+		IF NOT xPal_St11 THEN xStArmed := TRUE; END_IF
+
+		IF xPal_St11 AND NOT xStArmed THEN
+			sStPhase := 'SZTAPL. 4 IN8 JUZ zaslonony - odslon i zaslon ponownie';
+		END_IF
+
+		IF xStArmed AND xPal_St11 THEN nStStep := 50; END_IF
+
+	50:
+		sStPhase := 'SZTAPL. 5 zjazd na srodek - stos siada na palecie';
+		xStJawsClosed := TRUE;
+		xStGo       := TRUE;
+		diStGoToEnc := GVL_PERSIST.St11.Cfg.diPosMiddle;
+		IF xStAtPos THEN nStStep := 60; END_IF
+
+	60:
+		sStPhase := 'SZTAPL. 6 hamulec zalozony - szczeki otwieraja sie';
+		tStBrakeWait := tJawTime;
+
+		xStJawsClosed := TRUE;
+
+		IF NOT fbCamStack.xBrakeRelease THEN
+			xStJawsClosed := FALSE;
+		END_IF
+
+		// Po inkrementacji GVL_PERSIST.St11.Mem.nHeld to liczba palet w stosie,
+		// ktory lezy teraz na transporterze.
+		IF tonStBrake.Q THEN
+			GVL_PERSIST.St11.Mem.nHeld   := GVL_PERSIST.St11.Mem.nHeld + 1;
+			nStCycles := nStCycles + 1;
+			nStStep   := 80;
+		END_IF
+
+		IF tonStBrake.Q AND (GVL_PERSIST.St11.Mem.nHeld >= GVL_PERSIST.St11.Cfg.nStackSize) THEN
+			nStStep := 70;
+		END_IF
+
+	70:
+		sStPhase := 'SZTAPL. 7 stos pelny - czekam, az zjedzie ze stacji';
+		xStJawsClosed := FALSE;
+		xSt_StackReady := TRUE;
+
+		IF NOT xPal_St11 THEN
+			xSt_StackReady := FALSE;
+			GVL_PERSIST.St11.Mem.nHeld        := 0;
+			nStStep        := 0;
+		END_IF
+
+	80:
+		sStPhase := 'SZTAPL. 8 jazda na dol - pod caly stos';
+		xStJawsClosed := FALSE;
+		xStGo       := TRUE;
+		diStGoToEnc := GVL_PERSIST.St11.Cfg.diPosBottom;
+		IF xStAtPos THEN nStStep := 90; END_IF
+
+	90:
+		sStPhase := 'SZTAPL. 9 hamulec zalozony - odliczam przed chwytem';
+		xStJawsClosed := FALSE;
+		IF tonStBrake.Q THEN nStStep := 95; END_IF
+
+	95:
+		sStPhase := 'SZTAPL. 9b szczeki chwytaja stos od spodu';
+		xStJawsClosed := TRUE;
+		IF xStAdvance THEN nStStep := 30; END_IF
+
+	END_CASE
+
+END_IF
+
+
+// =============================================================
+// POMIAR CYKLU I PRZESTAWIENIE PUNKTU ODNIESIENIA
+// =============================================================
+//
+// Robimy to w kroku, w ktorym os STOI - nigdy w trakcie ruchu.
+// Poprzednia wersja przestawiala punkt odniesienia w chwili
+// dojazdu, czyli w srodku najdluzszego ruchu i wartoscia
+// zalezna od enkodera. To bylo prosze o klopoty.
+//
+// diAccum w chwili wejscia w krok 8 to droga przejechana od
+// poprzedniego dolu, czyli DLUGOSC CYKLU MASZYNY w impulsach.
+// Jesli enkoder jest 1:1 z korba, wyjdzie okolo 65536.
+
+IF xDeNewStep AND (nDeStep = 80) THEN
+
+	diDeCycleCounts := fbCamDestack.diAccum;
+
+	diTmp := fbCamDestack.diPos - GVL_PERSIST.St03.Cfg.diPosBottom;
+	IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+	IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+	diDeBottomErr := diTmp;
+
+	// Punkt odniesienia od zera. Wartosc nie ma juz znaczenia -
+	// kazdy krok liczy swoj cel od biezacego diAccum.
+	diDeAccumSet := 0;
+	xDeSetAccum  := TRUE;
+
+END_IF
+
+IF xStNewStep AND (nStStep = 90) THEN
+
+	diStCycleCounts := fbCamStack.diAccum;
+
+	diTmp := fbCamStack.diPos - GVL_PERSIST.St11.Cfg.diPosBottom;
+	IF diTmp >  32768 THEN diTmp := diTmp - 65536; END_IF
+	IF diTmp < -32768 THEN diTmp := diTmp + 65536; END_IF
+	diStBottomErr := diTmp;
+
+	diStAccumSet := 0;
+	xStSetAccum  := TRUE;
+
+END_IF
+
+
+// Najwiekszy zaobserwowany dojazd. Musi zostac MNIEJSZY niz
+// diCamOvershoot - inaczej ruch do punktu tuz za nami pojedzie
+// dookola calego obrotu.
+//
+// RESET_CAM kasuje pomiar, zeby dalo sie mierzyc od nowa bez
+// pobierania projektu.
+
+IF RESET_CAM THEN
+	diDeCoastMax := 0;
+	diStCoastMax := 0;
+END_IF
+
+IF ABS(fbCamDestack.diCoast) > diDeCoastMax THEN
+	diDeCoastMax := ABS(fbCamDestack.diCoast);
+END_IF
+
+IF ABS(fbCamStack.diCoast) > diStCoastMax THEN
+	diStCoastMax := ABS(fbCamStack.diCoast);
+END_IF
+
+
+// =============================================================
+// DOKAD JEDZIE KROK - PRZELICZENIE RAZ, PRZY WEJSCIU
+// =============================================================
+//
+// Krok powiedzial, do ktorej WARTOSCI ENKODERA ma dojechac.
+// Tu zamieniamy to na cel na skali narastajacej, liczac droge
+// do przodu z zywej pozycji - raz, w pierwszym cyklu kroku.
+//
+// Nigdzie nie zakladamy, ile impulsow ma cykl maszyny. Kazdy
+// ruch celuje w rzeczywisty punkt na korbie, wiec blad nie ma
+// sie z czego kumulowac.
+//
+// Jesli cel jest tuz ZA nami - mniej niz diCamOvershoot - droga
+// wynosi zero. Bez tego wozek, ktory przejechal punkt o dojazd,
+// objechalby caly obrot, zeby do niego wrocic.
+
+IF xDeNewStep THEN
+	diTmp := diDeGoToEnc - fbCamDestack.diPos;
+	IF diTmp < 0 THEN diTmp := diTmp + 65536; END_IF
+	IF diTmp >= (65536 - diCamOvershoot) THEN diTmp := 0; END_IF
+	diDeTarget := fbCamDestack.diAccum + diTmp;
+END_IF
+
+IF xStNewStep THEN
+	diTmp := diStGoToEnc - fbCamStack.diPos;
+	IF diTmp < 0 THEN diTmp := diTmp + 65536; END_IF
+	IF diTmp >= (65536 - diCamOvershoot) THEN diTmp := 0; END_IF
+	diStTarget := fbCamStack.diAccum + diTmp;
+END_IF
+
+
+// =============================================================
+// SZCZEKI -> CEWKI, CO CYKL
+// =============================================================
+//
+// Tu i tylko tu. Kazdy krok powiedzial juz, czy szczeki maja
+// byc zamkniete; my przepisujemy to na zawory w kazdym cyklu,
+// zeby ACT_ClearCoils nie mogl zabrac sterowania w trakcie
+// jazdy. To byl prawdziwy blad poprzedniej wersji.
+
+IF START_DESTACK OR xDeJog THEN
+	xSt03_JawClose := xDeJawsClosed;
+	xSt03_JawOpen  := NOT xDeJawsClosed;
+END_IF
+
+IF START_STACK OR xStJog THEN
+	xSt11_JawClose := xStJawsClosed;
+	xSt11_JawOpen  := NOT xStJawsClosed;
+END_IF
+
+
+// =============================================================
+// UCZENIE POZYCJI
+// =============================================================
+//
+// Zbocze bitu przepisuje biezaca pozycje do nastawy. Uzywa sie
+// tego przy zdjetym starcie, dojezdzajac jogiem.
+
+rtrgTeach[1](CLK := TEACH_DE_BOTTOM);
+rtrgTeach[2](CLK := TEACH_DE_MIDDLE);
+rtrgTeach[3](CLK := TEACH_DE_TOP);
+rtrgTeach[4](CLK := TEACH_ST_BOTTOM);
+rtrgTeach[5](CLK := TEACH_ST_MIDDLE);
+rtrgTeach[6](CLK := TEACH_ST_TOP);
+
+IF rtrgTeach[1].Q THEN
+	GVL_PERSIST.St03.Cfg.diPosBottom := fbCamDestack.diPos;
+	sTeachLast := CONCAT('DESZT. dolna = ', DINT_TO_STRING(GVL_PERSIST.St03.Cfg.diPosBottom));
+END_IF
+
+IF rtrgTeach[2].Q THEN
+	GVL_PERSIST.St03.Cfg.diPosMiddle := fbCamDestack.diPos;
+	sTeachLast := CONCAT('DESZT. posrednia = ', DINT_TO_STRING(GVL_PERSIST.St03.Cfg.diPosMiddle));
+END_IF
+
+IF rtrgTeach[3].Q THEN
+	GVL_PERSIST.St03.Cfg.diPosTop := fbCamDestack.diPos;
+	sTeachLast := CONCAT('DESZT. gorna = ', DINT_TO_STRING(GVL_PERSIST.St03.Cfg.diPosTop));
+END_IF
+
+IF rtrgTeach[4].Q THEN
+	GVL_PERSIST.St11.Cfg.diPosBottom := fbCamStack.diPos;
+	sTeachLast := CONCAT('SZTAPL. dolna = ', DINT_TO_STRING(GVL_PERSIST.St11.Cfg.diPosBottom));
+END_IF
+
+IF rtrgTeach[5].Q THEN
+	GVL_PERSIST.St11.Cfg.diPosMiddle := fbCamStack.diPos;
+	sTeachLast := CONCAT('SZTAPL. posrednia = ', DINT_TO_STRING(GVL_PERSIST.St11.Cfg.diPosMiddle));
+END_IF
+
+IF rtrgTeach[6].Q THEN
+	GVL_PERSIST.St11.Cfg.diPosTop := fbCamStack.diPos;
+	sTeachLast := CONCAT('SZTAPL. gorna = ', DINT_TO_STRING(GVL_PERSIST.St11.Cfg.diPosTop));
+END_IF
+
+
+// =============================================================
+// OSIE - JEDNO WYWOLANIE NA CYKL
+// =============================================================
+//
+// Wolane ZAWSZE, takze przy zdjetym starcie: inaczej hamulec
+// nie doliczylby swojego opoznienia po stopie, a pozycja
+// przestalaby sie odswiezac na podgladzie.
+
+fbCamDestack(
+	diRawPos		:= GVL.IO_Destaker_Act_Pos,
+	xEnable			:= (START_DESTACK OR xDeJog) AND xSafetyOK,
+	xGoTo			:= xDeGo,
+	xJogFwd			:= JOG_DESTACK_FWD AND xDeJog,
+	xJogRev			:= JOG_DESTACK_REV AND xDeJog,
+	diTargetAbs		:= diDeTarget,
+	xSetAccum		:= xDeSetAccum,
+	diSetAccumTo	:= diDeAccumSet,
+	xReset			:= RESET_CAM OR rtrgResetCycle.Q,
+	xDrvRunning		:= axDrvRunning[1],
+	diStopLead		:= diCamStopLead,
+	tBrakeReleaseLead := tCamBrakeRelease,
+	tBrakeHold		:= tCamBrakeHold);
+
+fbCamStack(
+	diRawPos		:= GVL.IO_Staker_Act_Pos,
+	xEnable			:= (START_STACK OR xStJog) AND xSafetyOK,
+	xGoTo			:= xStGo,
+	xJogFwd			:= JOG_STACK_FWD AND xStJog,
+	xJogRev			:= JOG_STACK_REV AND xStJog,
+	diTargetAbs		:= diStTarget,
+	xSetAccum		:= xStSetAccum,
+	diSetAccumTo	:= diStAccumSet,
+	xReset			:= RESET_CAM OR rtrgResetCycle.Q,
+	xDrvRunning		:= axDrvRunning[2],
+	diStopLead		:= diCamStopLead,
+	tBrakeReleaseLead := tCamBrakeRelease,
+	tBrakeHold		:= tCamBrakeHold);
+
+
+// -------------------------------------------------------------
+// ZYCIE ENKODEROW
+// -------------------------------------------------------------
+
+IF fbCamDestack.diPos <> diDePosOld THEN
+	nDeEncMoves := nDeEncMoves + 1;
+	diDePosOld  := fbCamDestack.diPos;
+END_IF
+
+IF fbCamStack.diPos <> diStPosOld THEN
+	nStEncMoves := nStEncMoves + 1;
+	diStPosOld  := fbCamStack.diPos;
+END_IF
+
+
+// -------------------------------------------------------------
+// ZADANIE DO WARSTWY NAPEDOW I HAMULCE
+// -------------------------------------------------------------
+
+axRunReq[1]  := fbCamDestack.xRunReq;
+axReverse[1] := fbCamDestack.xRev;
+
+axRunReq[2]  := fbCamStack.xRunReq;
+axReverse[2] := fbCamStack.xRev;
+
+xBrakeDestack := fbCamDestack.xBrakeRelease;
+xBrakeStack   := fbCamStack.xBrakeRelease;
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_ClearCoils" Id="{4a10e009-0000-4000-9000-00000000e009}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_ClearCoils
+// Zdjecie wszystkich cewek
+// =============================================================
+//
+// Przy zaworach dwucewkowych silownik zostaje tam, gdzie jest -
+// nie wraca sam. Przy trojpolozeniowych to polozenie spoczynkowe.
+
+xSt03_JawClose	:= FALSE;
+xSt03_JawOpen	:= FALSE;
+
+xSt04_UpExt		:= FALSE;
+xSt04_UpRet		:= FALSE;
+xSt04_LoExt		:= FALSE;
+xSt04_LoRet		:= FALSE;
+
+xSt05_BlockExt	:= FALSE;
+xSt05_BlockRet	:= FALSE;
+xSt05_LiftUp	:= FALSE;
+xSt05_LiftDown	:= FALSE;
+xSt05_JawClose	:= FALSE;
+
+FOR i := 1 TO 6 DO
+	axSt05_PullUp[i]	:= FALSE;
+	axSt05_PullDown[i]	:= FALSE;
+END_FOR
+
+xSt08_Up		:= FALSE;
+xSt08_Down		:= FALSE;
+xSt10_Up		:= FALSE;
+xSt10_Down		:= FALSE;
+
+xSt11_JawClose	:= FALSE;
+xSt11_JawOpen	:= FALSE;
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Config" Id="{4a10e001-0000-4000-9000-00000000e001}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Config
+// Jednorazowe ustawienia
+// =============================================================
+
+// Cala akcja wykonuje sie raz. Swiadomie BEZ instrukcji RETURN -
+// w akcji programu potrafi ona wyjsc z calego POU, a wtedy nic
+// dalszego by sie nie wykonalo.
+IF NOT xInit THEN
+
+xInit := TRUE;
+
+
+// -------------------------------------------------------------
+// DOPUSZCZENIE NAPEDOW
+// -------------------------------------------------------------
+//
+// Domyslnie wszystkie transportery dopuszczone.
+
+FOR i := 1 TO 20 DO
+	axDriveEnabled[i] := TRUE;
+END_FOR
+
+// Krzywki podnoszenia palet. Sterowane WYLACZNIE przez
+// ACT_CamCycles - tabela krokow transportu nigdy o nie nie pyta.
+//   1  krzywka desztaplarki, stacja 3
+//   2  krzywka sztaplarki,   stacja 11 (zasilana ze stacji 8)
+axDriveEnabled[1] := TRUE;
+axDriveEnabled[2] := TRUE;
+
+// Rolki dociskowe stacji 4 - DOPUSZCZONE.
+//
+// Kreca sie sprzegniete z transporterem stacji 4 (naped 4):
+// jedzie transporter, kreca sie rolki. Sprzezenie robi
+// ACT_ApplyDrives, nie tabela krokow.
+//
+// Kierunek wybiera bit xSt04_RollRev, do przestawienia ONLINE.
+//
+// NA RAZIE ZABLOKOWANE. Przy pelnej czestotliwosci rolki pchaly
+// palete tak mocno, ze wykladaly falownik transportera stacji 4.
+// Rolki maja palecie TOWARZYSZYC, nie ja napedzac - ich predkosc
+// obwodowa musi byc rowna predkosci transportera albo minimalnie
+// nizsza.
+//
+// Zanim wlaczysz je z powrotem, ustaw im WLASNA czestotliwosc:
+//     alrDriveFreq[3] := <Hz>
+// (zero znaczy "uzyj lrTestFreq" - i to wlasnie bylo za duzo).
+// Dopuszczenie: axDriveEnabled[3] := TRUE, online, bez pobierania.
+axDriveEnabled[3] := FALSE;
+
+// Falownik 20 nie istnieje w konfiguracji
+axDriveEnabled[20] := FALSE;
+
+
+// -------------------------------------------------------------
+// KIERUNEK OBROTOW
+// -------------------------------------------------------------
+//
+// Zle podlaczone silniki. Numery falownikow wg przydzialu:
+//   stacja 1  -> falownik 8
+//   stacja 3  -> falownik 10   (stwierdzone przy pierwszej probie)
+//   stacja 5  -> falownik 5
+//   stacja 6  -> falownik 6
+//   stacja 7  -> falownik 11
+//   stacja 8  -> falownik 12
+//   stacja 9  -> falownik 7
+//   stacja 14 -> falownik 17
+//   stacja 15 -> falownik 18
+//   stacja 16 -> falownik 19
+
+FOR i := 1 TO 20 DO
+	axReverse[i] := FALSE;
+END_FOR
+
+// Krzywki 1 i 2 jada w dobra strone - kierunku NIE odwracamy
+// na stale. O kierunku decyduje FB_CamAxis, bo powrot do zera
+// potrafi wypasc w druga strone.
+axReverse[8]  := TRUE;
+axReverse[10] := TRUE;		// stacja 3 - stwierdzone na maszynie
+axReverse[5]  := TRUE;
+axReverse[6]  := TRUE;
+axReverse[11] := TRUE;
+axReverse[12] := TRUE;
+axReverse[7]  := TRUE;
+axReverse[17] := TRUE;
+axReverse[18] := TRUE;
+axReverse[19] := TRUE;
+
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Drives" Id="{4a10e004-0000-4000-9000-00000000e004}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Drives
+// Wywolanie falownikow - PO wystawieniu zadan
+// =============================================================
+
+xAnyDriveFault := FALSE;
+
+FOR i := 1 TO cNumDrives DO
+
+	fbNord[i](
+		lrFmax			:= cFmax,
+		xSafetyOK		:= xSafetyOK,
+		// TODO: podpiac realny status EtherCAT (WcState)
+		xEtherCAT_OK	:= TRUE,
+		stIn			:= GVL.NORD_DRIVE_IN[i]
+	);
+
+	GVL.NORD_DRIVE_OUT[i] := fbNord[i].stOut;
+
+	aeDrvState[i]		:= fbNord[i].eState;
+	axDrvRunning[i]		:= fbNord[i].xRunning;
+	axDrvFault[i]		:= fbNord[i].xFault;
+	axDrvError[i]		:= fbNord[i].xError;
+	awDrvStatus[i]		:= fbNord[i].wStatusWord;
+	awDrvControl[i]		:= fbNord[i].wControlWord;
+	alrDrvFreqAct[i]	:= fbNord[i].lrFreqActual;
+
+	IF axDrvFault[i] THEN
+		xAnyDriveFault := TRUE;
+	END_IF
+
+END_FOR
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Inputs" Id="{4a10e00f-0000-4000-9000-00000000e00f}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Inputs
+// Czujniki - JEDYNE miejsce, w ktorym interpretujemy polaryzacje
+// =============================================================
+//
+// Czesc czujnikow daje 1 przy palecie, czesc 0. Nizej jest to
+// sprowadzone do jednego znaczenia: xPal_* = TRUE znaczy
+// PALETA JEST. Reszta programu nie zna juz polaryzacji.
+//
+//   IN1   stacja 1              1 = paleta   NIE UZYWANY
+//   IN2   stacja 3              1 = paleta
+//   IN3   za desztaplarka       0 = paleta   wjazd na stacje 4
+//   IN4   koniec testu desek    0 = paleta   stacja 4
+//   IN5   stacja 7              1 = paleta
+//   IN6   koniec stacji 13      0 = paleta
+//   IN7   stacja 8              1 = paleta
+//   IN8   stacja 11             1 = paleta
+//   IN9   niepodlaczony
+//   IN10  stacja 16             1 = paleta
+
+
+// Surowy obraz wejsc - do podgladu bez otwierania GVL
+FOR i := 1 TO 10 DO
+	axInRaw[i] := GVL.INPUTS[i];
+END_FOR
+
+
+// -------------------------------------------------------------
+// POLARYZACJA - Z TABLICY, NIE Z KODU
+// -------------------------------------------------------------
+//
+// XOR z axInInverted sprowadza kazdy czujnik do jednego
+// znaczenia: TRUE = PALETA JEST. Zmiana polaryzacji to
+// przestawienie jednego bitu online.
+
+xPal_St03		:= GVL.INPUTS[2]  XOR axInInverted[2];
+xPal_St04In		:= GVL.INPUTS[3]  XOR axInInverted[3];
+xPal_St04End	:= GVL.INPUTS[4]  XOR axInInverted[4];
+xPal_St07		:= GVL.INPUTS[5]  XOR axInInverted[5];
+xPal_St13		:= GVL.INPUTS[6]  XOR axInInverted[6];
+xPal_St08		:= GVL.INPUTS[7]  XOR axInInverted[7];
+xPal_St11		:= GVL.INPUTS[8]  XOR axInInverted[8];
+xPal_St16		:= GVL.INPUTS[10] XOR axInInverted[10];
+
+
+// -------------------------------------------------------------
+// STACJA 1 - BIT ZAMIAST CZUJNIKA
+// -------------------------------------------------------------
+//
+// Czujnika IN1 swiadomie nie czytamy. Poziom xSt01_StackReady
+// mowi "stos stoi i mozna nim jechac", a zbocze 0 -> 1 znaczy,
+// ze na stacji 1 stanal NOWY stos.
+
+rtrgStack(CLK := xSt01_StackReady);
+
+IF rtrgStack.Q THEN
+	nStacksSeen := nStacksSeen + 1;
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Logger" Id="{4a10e013-0000-4000-9000-000000000013}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Logger
+// Obserwator stanu - decyduje KIEDY pisac wiersz
+// =============================================================
+//
+// Wiersz okresowy co tLogPeriod plus wiersz na kazde zdarzenie.
+// Co JEST w wierszu - patrz ACT_LogRow. Ta akcja niczego nie
+// zmienia w procesie; czyta tylko.
+//
+// Kolejnosc: najpierw naglowek (gdy plik dopiero powstal),
+// potem ewentualny wiersz, na koncu wywolanie bloku pliku.
+
+
+// -------------------------------------------------------------
+// ZDARZENIA - porownanie ze stanem z poprzedniego cyklu
+// -------------------------------------------------------------
+
+xLogEvent := FALSE;
+sLogWhy   := '';
+
+// Bity, ktorych zmiana jest zdarzeniem
+axLogBit[1]  := START_TEST;
+axLogBit[2]  := START_FEED;
+axLogBit[3]  := START_DESTACK;
+axLogBit[4]  := START_STACK;
+axLogBit[5]  := rtrgResetCycle.Q;
+axLogBit[6]  := RESET_CAM;
+axLogBit[7]  := xCmdResetDrives;
+axLogBit[8]  := xSt01_StackReady;
+axLogBit[9]  := xDe_PalletReleased;
+axLogBit[10] := xSt05_Done;
+axLogBit[11] := xSt08_PalletNOK;
+axLogBit[12] := xOutStart;
+axLogBit[13] := xOut2Start;
+axLogBit[14] := xOut3Start;
+axLogBit[15] := xDeJawsClosed;
+axLogBit[16] := xStJawsClosed;
+axLogBit[17] := fbCamDestack.xInPos;
+axLogBit[18] := fbCamStack.xInPos;
+axLogBit[19] := fbCamDestack.xStall OR fbCamDestack.xNoDrvAck;
+axLogBit[20] := fbCamStack.xStall OR fbCamStack.xNoDrvAck;
+axLogBit[21] := GVL_SAFETY.xSTO;
+axLogBit[22] := GVL_SAFETY.xAir;
+axLogBit[23] := fbCamDestack.xBrakeRelease;
+axLogBit[24] := fbCamStack.xBrakeRelease;
+
+IF NOT xLogInit THEN
+	xLogInit  := TRUE;
+	xLogEvent := TRUE;
+	sLogWhy   := 'start';
+END_IF
+
+IF (nDeStep <> anLogStepOld[1]) OR (nStStep <> anLogStepOld[2])
+   OR (nFeedStep <> anLogStepOld[3]) OR (nOutStep <> anLogStepOld[4])
+   OR (nOut2Step <> anLogStepOld[5]) OR (nOut3Step <> anLogStepOld[6]) THEN
+	xLogEvent := TRUE;
+	sLogWhy   := CONCAT(sLogWhy, 'step ');
+END_IF
+
+FOR nLogI := 1 TO 10 DO
+	IF GVL.INPUTS[nLogI] <> axLogInOld[nLogI] THEN
+		xLogEvent := TRUE;
+		sLogWhy   := CONCAT(sLogWhy, 'in ');
+		EXIT;
+	END_IF
+END_FOR
+
+FOR nLogI := 1 TO cNumDrives DO
+	IF axRunReq[nLogI] <> axLogReqOld[nLogI] THEN
+		xLogEvent := TRUE;
+		sLogWhy   := CONCAT(sLogWhy, 'drv ');
+		EXIT;
+	END_IF
+END_FOR
+
+FOR nLogI := 1 TO cNumDrives DO
+	IF axDrvFault[nLogI] AND NOT axLogFaultOld[nLogI] THEN
+		xLogEvent := TRUE;
+		sLogWhy   := CONCAT(sLogWhy, 'FAULT ');
+		EXIT;
+	END_IF
+END_FOR
+
+FOR nLogI := 1 TO 24 DO
+	IF axLogBit[nLogI] <> axLogBitOld[nLogI] THEN
+		xLogEvent := TRUE;
+		sLogWhy   := CONCAT(sLogWhy, 'bit ');
+		EXIT;
+	END_IF
+END_FOR
+
+IF (ABS(fbCamDestack.diStep) > diLogEncJump) OR (ABS(fbCamStack.diStep) > diLogEncJump) THEN
+	xLogEvent := TRUE;
+	sLogWhy   := CONCAT(sLogWhy, 'ENCJUMP ');
+END_IF
+
+// Pamiec na nastepny cykl
+anLogStepOld[1] := nDeStep;
+anLogStepOld[2] := nStStep;
+anLogStepOld[3] := nFeedStep;
+anLogStepOld[4] := nOutStep;
+anLogStepOld[5] := nOut2Step;
+anLogStepOld[6] := nOut3Step;
+
+FOR nLogI := 1 TO 10 DO
+	axLogInOld[nLogI] := GVL.INPUTS[nLogI];
+END_FOR
+
+FOR nLogI := 1 TO cNumDrives DO
+	axLogReqOld[nLogI]   := axRunReq[nLogI];
+	axLogFaultOld[nLogI] := axDrvFault[nLogI];
+END_FOR
+
+FOR nLogI := 1 TO 24 DO
+	axLogBitOld[nLogI] := axLogBit[nLogI];
+END_FOR
+
+
+// -------------------------------------------------------------
+// TAKT OKRESOWY
+// -------------------------------------------------------------
+
+tonLog(IN := TRUE, PT := tLogPeriod);
+
+IF tonLog.Q THEN
+	tonLog(IN := FALSE);
+	IF NOT xLogEvent THEN
+		sLogWhy := 'tick';
+	END_IF
+	xLogEvent := TRUE;
+END_IF
+
+
+// -------------------------------------------------------------
+// MASKI ZAWOROW FESTO - 16 cewek w jednym slowie
+// -------------------------------------------------------------
+//
+// bit = (i-1)*2 + (j-1):  bit0 = [1,1], bit1 = [1,2], bit2 = [2,1] ...
+
+wLogFesto1 := 0;
+wLogFesto2 := 0;
+
+FOR nLogI := 1 TO 8 DO
+	FOR nLogJ := 1 TO 2 DO
+		IF GVL.FestoValves_1[nLogI, nLogJ] THEN
+			wLogFesto1 := wLogFesto1 OR SHL(WORD#1, (nLogI - 1) * 2 + (nLogJ - 1));
+		END_IF
+		IF GVL.FestoValves_2[nLogI, nLogJ] THEN
+			wLogFesto2 := wLogFesto2 OR SHL(WORD#1, (nLogI - 1) * 2 + (nLogJ - 1));
+		END_IF
+	END_FOR
+END_FOR
+
+
+// -------------------------------------------------------------
+// NAGLOWEK, WIERSZ, PLIK
+// -------------------------------------------------------------
+
+IF xLogEnable AND fbLog.xHeaderPending THEN
+	fbLog.xHeaderMode := TRUE;
+	ACT_LogRow();
+	fbLog.xHeaderMode := FALSE;
+END_IF
+
+IF xLogEnable AND xLogEvent THEN
+	ACT_LogRow();
+	nLogRows := nLogRows + 1;
+END_IF
+
+// Nowy plik: RESET_CYCLE albo bit reczny. Bit sam sie zdejmuje.
+fbLog(xNewFile := rtrgResetCycle.Q OR xLogNewFile);
+
+xLogNewFile := FALSE;
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_LogRow" Id="{4a10e014-0000-4000-9000-000000000014}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_LogRow
+// Obserwator stanu - CO jest w wierszu
+// =============================================================
+//
+// Jedna lista kolumn dla naglowka i dla danych: metoda M_*
+// dostaje nazwe i wartosc, a fbLog.xHeaderMode decyduje, ktore
+// z nich trafi do pliku. Dodajesz kolumne = dopisujesz JEDNA
+// linijke tutaj. Kolejnosc kolumn = kolejnosc ponizej.
+//
+// Nazwy kolumn krotkie i bez spacji - czyta to potem skrypt.
+
+fbLog.M_Begin();
+
+// -------------------------------------------------------------
+// CZAS I POWOD
+// -------------------------------------------------------------
+
+fbLog.M_UInt ('t_ms',            fbLog.udiFileMs);
+fbLog.M_Clock('clock');
+fbLog.M_Str  ('why',             sLogWhy);
+fbLog.M_UInt ('nCycles',         nCycles);
+
+
+// -------------------------------------------------------------
+// KROKI MASZYN STANU
+// -------------------------------------------------------------
+
+fbLog.M_Int  ('nDeStep',         nDeStep);
+fbLog.M_Int  ('nStStep',         nStStep);
+fbLog.M_Int  ('nFeedStep',       nFeedStep);
+fbLog.M_Int  ('nOutStep',        nOutStep);
+fbLog.M_Int  ('nOut2Step',       nOut2Step);
+fbLog.M_Int  ('nOut3Step',       nOut3Step);
+fbLog.M_Str  ('sDePhase',        sDePhase);
+fbLog.M_Str  ('sFeedPhase',      sFeedPhase);
+fbLog.M_Str  ('sOutPhase',       sOutPhase);
+
+
+// -------------------------------------------------------------
+// BITY OPERATORA I UZGODNIENIA
+// -------------------------------------------------------------
+
+fbLog.M_Bool ('START_TEST',      START_TEST);
+fbLog.M_Bool ('START_FEED',      START_FEED);
+fbLog.M_Bool ('START_DESTACK',   START_DESTACK);
+fbLog.M_Bool ('START_STACK',     START_STACK);
+fbLog.M_Bool ('RESET_CYCLE',     rtrgResetCycle.Q);
+fbLog.M_Bool ('RESET_CAM',       RESET_CAM);
+fbLog.M_Bool ('xCmdResetDrives', xCmdResetDrives);
+fbLog.M_Bool ('xSt01_StackReady', xSt01_StackReady);
+fbLog.M_Bool ('xDe_PalletReleased', xDe_PalletReleased);
+fbLog.M_Bool ('xDe_Empty',       xDe_Empty);
+fbLog.M_Bool ('xSt05_Done',      xSt05_Done);
+fbLog.M_Bool ('xSt05_CanPass',   xSt05_CanPass);
+fbLog.M_Bool ('xSt08_PalletNOK', xSt08_PalletNOK);
+fbLog.M_Bool ('xSt08_AtStation', xSt08_AtStation);
+fbLog.M_Bool ('xSt08_RollDown',  xSt08_RollDown);
+fbLog.M_Bool ('xOutStart',       xOutStart);
+fbLog.M_Bool ('xOut2Start',      xOut2Start);
+fbLog.M_Bool ('xOut3Start',      xOut3Start);
+fbLog.M_Bool ('xChainInterlock', xChainInterlock);
+fbLog.M_Bool ('xSt05_BlockLock', xSt05_BlockLock);
+fbLog.M_Bool ('xResetInProgress', xResetInProgress);
+fbLog.M_Bool ('xResetFailed',    xResetFailed);
+fbLog.M_Bool ('xAnyDriveFault',  xAnyDriveFault);
+fbLog.M_Bool ('xAnyDriveError',  xAnyDriveError);
+fbLog.M_UInt ('nFeedPallets',    nFeedPallets);
+fbLog.M_UInt ('nStacksSeen',     nStacksSeen);
+
+
+// -------------------------------------------------------------
+// BEZPIECZENSTWO
+// -------------------------------------------------------------
+
+fbLog.M_Bool ('xSTO',            GVL_SAFETY.xSTO);
+fbLog.M_Bool ('xAir',            GVL_SAFETY.xAir);
+fbLog.M_Bool ('xResetCmd',       GVL_SAFETY.xResetCmd);
+
+
+// -------------------------------------------------------------
+// CZUJNIKI - surowe i po polaryzacji
+// -------------------------------------------------------------
+
+fbLog.M_Bool ('in1',             GVL.INPUTS[1]);
+fbLog.M_Bool ('in2',             GVL.INPUTS[2]);
+fbLog.M_Bool ('in3',             GVL.INPUTS[3]);
+fbLog.M_Bool ('in4',             GVL.INPUTS[4]);
+fbLog.M_Bool ('in5',             GVL.INPUTS[5]);
+fbLog.M_Bool ('in6',             GVL.INPUTS[6]);
+fbLog.M_Bool ('in7',             GVL.INPUTS[7]);
+fbLog.M_Bool ('in8',             GVL.INPUTS[8]);
+fbLog.M_Bool ('in9',             GVL.INPUTS[9]);
+fbLog.M_Bool ('in10',            GVL.INPUTS[10]);
+fbLog.M_Bool ('xPal_St03',       xPal_St03);
+fbLog.M_Bool ('xPal_St04In',     xPal_St04In);
+fbLog.M_Bool ('xPal_St04End',    xPal_St04End);
+fbLog.M_Bool ('xPal_St07',       xPal_St07);
+fbLog.M_Bool ('xPal_St13',       xPal_St13);
+fbLog.M_Bool ('xPal_St08',       xPal_St08);
+fbLog.M_Bool ('xPal_St11',       xPal_St11);
+fbLog.M_Bool ('xPal_St16',       xPal_St16);
+
+
+// -------------------------------------------------------------
+// DESZTAPLARKA - stacja 3, os 1
+// -------------------------------------------------------------
+
+fbLog.M_Int  ('de_nHeld',        GVL_PERSIST.St03.Mem.nHeld);
+fbLog.M_Int  ('de_nRemaining',   GVL_PERSIST.St03.Mem.nRemaining);
+fbLog.M_Int  ('de_nStackSize',   GVL_PERSIST.St03.Cfg.nStackSize);
+fbLog.M_UInt ('de_nCycles',      nDeCycles);
+fbLog.M_Int  ('de_raw',          GVL.IO_Destaker_Act_Pos);
+fbLog.M_Int  ('de_pos',          fbCamDestack.diPos);
+fbLog.M_Int  ('de_accum',        fbCamDestack.diAccum);
+fbLog.M_Int  ('de_remain',       fbCamDestack.diRemain);
+fbLog.M_Int  ('de_step',         fbCamDestack.diStep);
+fbLog.M_Int  ('de_turns',        fbCamDestack.diTurns);
+fbLog.M_Int  ('de_coast',        fbCamDestack.diCoast);
+fbLog.M_Int  ('de_moved',        fbCamDestack.diMoved);
+fbLog.M_Int  ('de_target',       diDeTarget);
+fbLog.M_Int  ('de_goToEnc',      diDeGoToEnc);
+fbLog.M_Bool ('de_go',           xDeGo);
+fbLog.M_Bool ('de_inPos',        fbCamDestack.xInPos);
+fbLog.M_Bool ('de_atPos',        xDeAtPos);
+fbLog.M_Bool ('de_runReq',       fbCamDestack.xRunReq);
+fbLog.M_Bool ('de_rev',          fbCamDestack.xRev);
+fbLog.M_Bool ('de_brakeRel',     fbCamDestack.xBrakeRelease);
+fbLog.M_Bool ('de_brakeWait',    fbCamDestack.xBrakeWait);
+fbLog.M_Bool ('de_atRest',       fbCamDestack.xAtRest);
+fbLog.M_Bool ('de_stall',        fbCamDestack.xStall);
+fbLog.M_Bool ('de_noDrvAck',     fbCamDestack.xNoDrvAck);
+fbLog.M_Bool ('de_jawsClosed',   xDeJawsClosed);
+fbLog.M_Bool ('de_armed',        xDeArmed);
+fbLog.M_Bool ('de_cfgOK',        xDeCfgOK);
+fbLog.M_Bool ('de_jog',          xDeJog);
+fbLog.M_Int  ('de_posBottom',    GVL_PERSIST.St03.Cfg.diPosBottom);
+fbLog.M_Int  ('de_posMiddle',    GVL_PERSIST.St03.Cfg.diPosMiddle);
+fbLog.M_Int  ('de_posTop',       GVL_PERSIST.St03.Cfg.diPosTop);
+fbLog.M_Int  ('de_cycleCounts',  diDeCycleCounts);
+fbLog.M_Int  ('de_bottomErr',    diDeBottomErr);
+fbLog.M_Int  ('de_coastMax',     diDeCoastMax);
+fbLog.M_UInt ('de_encMoves',     nDeEncMoves);
+
+
+// -------------------------------------------------------------
+// SZTAPLARKA - stacja 11, os 2
+// -------------------------------------------------------------
+
+fbLog.M_Int  ('st_nHeld',        GVL_PERSIST.St11.Mem.nHeld);
+fbLog.M_UInt ('st_nCycles',      nStCycles);
+fbLog.M_Int  ('st_raw',          GVL.IO_Staker_Act_Pos);
+fbLog.M_Int  ('st_pos',          fbCamStack.diPos);
+fbLog.M_Int  ('st_accum',        fbCamStack.diAccum);
+fbLog.M_Int  ('st_remain',       fbCamStack.diRemain);
+fbLog.M_Int  ('st_step',         fbCamStack.diStep);
+fbLog.M_Int  ('st_coast',        fbCamStack.diCoast);
+fbLog.M_Int  ('st_target',       diStTarget);
+fbLog.M_Int  ('st_goToEnc',      diStGoToEnc);
+fbLog.M_Bool ('st_go',           xStGo);
+fbLog.M_Bool ('st_inPos',        fbCamStack.xInPos);
+fbLog.M_Bool ('st_runReq',       fbCamStack.xRunReq);
+fbLog.M_Bool ('st_brakeRel',     fbCamStack.xBrakeRelease);
+fbLog.M_Bool ('st_stall',        fbCamStack.xStall);
+fbLog.M_Bool ('st_noDrvAck',     fbCamStack.xNoDrvAck);
+fbLog.M_Bool ('st_jawsClosed',   xStJawsClosed);
+fbLog.M_Bool ('st_armed',        xStArmed);
+fbLog.M_Bool ('st_cfgOK',        xStCfgOK);
+fbLog.M_Bool ('xSt_StackReady',  xSt_StackReady);
+
+
+// -------------------------------------------------------------
+// CEWKI - to, co poszlo na wyjscia w tym cyklu
+// -------------------------------------------------------------
+
+FOR nLogI := 1 TO 17 DO
+	sLogPfx := CONCAT('out', INT_TO_STRING(nLogI));
+	fbLog.M_Bool(sLogPfx, GVL.OUTPUTS[nLogI]);
+END_FOR
+
+fbLog.M_Hex  ('festo1',          wLogFesto1);
+fbLog.M_Hex  ('festo2',          wLogFesto2);
+
+fbLog.M_Bool ('xFeed05_Block',   xFeed05_Block);
+fbLog.M_Bool ('xFeed05_Lift',    xFeed05_Lift);
+fbLog.M_Bool ('xFeed05_Jaws',    xFeed05_Jaws);
+fbLog.M_Bool ('xFeed05_Pull',    xFeed05_Pull);
+fbLog.M_Bool ('xFeedPressOn',    xFeedPressOn);
+fbLog.M_Bool ('xFeedPressLoOn',  xFeedPressLoOn);
+fbLog.M_Bool ('xFeedRoll08Up',   xFeedRoll08Up);
+fbLog.M_Bool ('xFeedRoll10Up',   xFeedRoll10Up);
+
+
+// -------------------------------------------------------------
+// NAPEDY 1..cNumDrives
+// -------------------------------------------------------------
+//
+//   dN_req   zadanie z sekwencji (axRunReq)
+//   dN_run   falownik potwierdza prace
+//   dN_flt   blad falownika (bit 3 StatusWord)
+//   dN_sw    StatusWord szesnastkowo
+//   dN_st    stan bloku FB_NordSK550PP (E_NordSK550P_State)
+//   dN_hz    czestotliwosc rzeczywista
+
+FOR nLogI := 1 TO cNumDrives DO
+	sLogPfx := CONCAT('d', INT_TO_STRING(nLogI));
+	fbLog.M_Bool(CONCAT(sLogPfx, '_req'), axRunReq[nLogI]);
+	fbLog.M_Bool(CONCAT(sLogPfx, '_run'), axDrvRunning[nLogI]);
+	fbLog.M_Bool(CONCAT(sLogPfx, '_flt'), axDrvFault[nLogI]);
+	fbLog.M_Hex (CONCAT(sLogPfx, '_sw'),  UINT_TO_WORD(awDrvStatus[nLogI]));
+	fbLog.M_Int (CONCAT(sLogPfx, '_st'),  TO_DINT(aeDrvState[nLogI]));
+	fbLog.M_Real(CONCAT(sLogPfx, '_hz'),  alrDrvFreqAct[nLogI]);
+END_FOR
+
+
+// -------------------------------------------------------------
+// SAM LOGGER - zeby bylo widac, czy nie gubi
+// -------------------------------------------------------------
+
+fbLog.M_UInt ('log_dropped',     fbLog.nLinesDropped);
+fbLog.M_UInt ('log_errors',      fbLog.nErrors);
+fbLog.M_UInt ('log_lastErr',     fbLog.nLastErrId);
+
+fbLog.M_End();
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_ManualCyl" Id="{4a10e00a-0000-4000-9000-00000000e00a}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_ManualCyl
+// Reczne sterowanie jednym silownikiem
+// =============================================================
+//
+// Sluzy do sprawdzenia, czy dane wyjscie w ogole dochodzi do
+// zaworu. Sekwencja stoi, transportery stoja - rusza sie tylko
+// to, co wybierzesz.
+//
+// xManExtend i xManRetract dzialaja poziomem, nie zboczem:
+// trzymasz bit, cewka jest podana.
+
+ACT_ClearCoils();
+
+IF NOT xManExtend AND NOT xManRetract THEN
+	sPhase := CONCAT('RECZNIE - silownik ', INT_TO_STRING(nManCyl));
+	sPhase := CONCAT(sPhase, ' - brak komendy');
+	RETURN;
+END_IF
+
+IF xManExtend AND xManRetract THEN
+	sPhase := 'RECZNIE - obie komendy naraz, nic nie robie';
+	RETURN;
+END_IF
+
+
+sPhase := CONCAT('RECZNIE - silownik ', INT_TO_STRING(nManCyl));
+
+
+CASE nManCyl OF
+
+1:	xSt03_JawClose	:= xManExtend;
+	xSt03_JawOpen	:= xManRetract;
+
+2:	xSt04_UpExt		:= xManExtend;
+	xSt04_UpRet		:= xManRetract;
+
+3:	xSt04_LoExt		:= xManExtend;
+	xSt04_LoRet		:= xManRetract;
+
+4:	xSt05_BlockExt	:= xManExtend;
+	xSt05_BlockRet	:= xManRetract;
+
+5:	xSt05_LiftUp	:= xManExtend;
+	xSt05_LiftDown	:= xManRetract;
+
+6:	xSt05_JawClose	:= xManExtend;
+
+7:	axSt05_PullUp[1]	:= xManExtend;
+	axSt05_PullDown[1]	:= xManRetract;
+
+8:	axSt05_PullUp[2]	:= xManExtend;
+	axSt05_PullDown[2]	:= xManRetract;
+
+9:	axSt05_PullUp[3]	:= xManExtend;
+	axSt05_PullDown[3]	:= xManRetract;
+
+10:	axSt05_PullUp[4]	:= xManExtend;
+	axSt05_PullDown[4]	:= xManRetract;
+
+11:	axSt05_PullUp[5]	:= xManExtend;
+	axSt05_PullDown[5]	:= xManRetract;
+
+12:	axSt05_PullUp[6]	:= xManExtend;
+	axSt05_PullDown[6]	:= xManRetract;
+
+13:	xSt08_Up		:= xManExtend;
+	xSt08_Down		:= xManRetract;
+
+14:	xSt10_Up		:= xManExtend;
+	xSt10_Down		:= xManRetract;
+
+15:	xSt11_JawClose	:= xManExtend;
+	xSt11_JawOpen	:= xManRetract;
+
+ELSE
+	sPhase := 'RECZNIE - nieznany numer silownika';
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Move" Id="{4a10e007-0000-4000-9000-00000000e007}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Move
+// Przejazd miedzy stacjami - mechanika stoi
+// =============================================================
+//
+// Pracuje PARA transporterow: ten, z ktorego paleta zjezdza,
+// i ten, na ktory wjezdza. Wyjatkiem jest przejazd poprzeczny,
+// gdzie jedzie sam lancuch.
+
+tThisStep := tStepTime;
+
+// TRUE = przejazd ma jeszcze kroki wewnetrzne, nIdx zostaje
+xHoldIdx := FALSE;
+
+
+CASE nIdx OF
+
+1:	axRunReq[8] := TRUE;  axRunReq[9] := TRUE;
+	sPhase := 'przejazd st.1 -> st.2   (falowniki 8 + 9)';
+
+2:	axRunReq[9] := TRUE;  axRunReq[10] := TRUE;
+	xWaitSensor := TRUE;  xSensorOK := xPal_St03;
+	sPhase := 'przejazd st.2 -> st.3, czekam na czujnik st.3 (IN2)';
+
+3:	ACT_MoveSt04();
+
+4:	axRunReq[4] := TRUE;  axRunReq[5] := TRUE;
+	sPhase := 'przejazd st.4 -> st.5   (falowniki 4 + 5)';
+
+5:	axRunReq[5] := TRUE;  axRunReq[6] := TRUE;
+	sPhase := 'przejazd st.5 -> st.6   (falowniki 5 + 6)';
+
+6:	axRunReq[6] := TRUE;  axRunReq[11] := TRUE;
+	xWaitSensor := TRUE;  xSensorOK := xPal_St07;
+	sPhase := 'przejazd st.6 -> st.7, czekam na czujnik st.7 (IN5)';
+
+7:	axRunReq[11] := TRUE; axRunReq[12] := TRUE;
+	xWaitSensor := TRUE;  xSensorOK := xPal_St08;
+	sPhase := 'przejazd st.7 -> st.8, czekam na czujnik st.8 (IN7)';
+
+8:	axRunReq[12] := TRUE; axRunReq[13] := TRUE;
+	xWaitSensor := TRUE;  xSensorOK := xPal_St11;
+	sPhase := 'przejazd st.8 -> st.11, czekam na czujnik st.11 (IN8)';
+
+9:	axRunReq[13] := TRUE; axRunReq[14] := TRUE;
+	sPhase := 'przejazd st.11 -> st.12 (falowniki 13 + 14)';
+
+10:	axRunReq[14] := TRUE; axRunReq[15] := TRUE;
+	xWaitSensor := TRUE;  xSensorOK := xPal_St13;
+	sPhase := 'przejazd st.12 -> st.13, czekam na czujnik st.13 (IN6)';
+
+12:	// Przejazd poprzeczny. Rolki stacji 8 i 10 sa opuszczone,
+	// paleta lezy na lancuchu - te transportery MUSZA stac.
+	axRunReq[7] := TRUE;
+	tThisStep := tChainTime;
+	sPhase := 'przejazd st.8 -> st.10 lancuchem (falownik 7)';
+
+13:	axRunReq[16] := TRUE; axRunReq[17] := TRUE;
+	sPhase := 'przejazd st.10 -> st.14 (falowniki 16 + 17)';
+
+14:	axRunReq[17] := TRUE; axRunReq[18] := TRUE;
+	sPhase := 'przejazd st.14 -> st.15 (falowniki 17 + 18)';
+
+15:	axRunReq[18] := TRUE; axRunReq[19] := TRUE;
+	xWaitSensor := TRUE;  xSensorOK := xPal_St16;
+	sPhase := 'przejazd st.15 -> st.16, czekam na czujnik st.16 (IN10)';
+
+ELSE
+	sPhase := 'przejazd poza tabela';
+
+END_CASE
+
+
+// Po przejezdzie paleta stoi na nastepnej stacji.
+// xHoldIdx znaczy, ze przejazd ma jeszcze wlasne kroki wewnetrzne
+// (stacja 4) - wtedy nIdx zostaje, przesuwa sie samo nSub.
+
+IF xAdvance AND NOT xHoldIdx THEN
+	nIdx	:= nIdx + 1;
+	nSub	:= 0;
+	xMoving	:= FALSE;
+
+	IF nIdx > cLastIdx THEN
+		nIdx := 0;
+	END_IF
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_MoveSt04" Id="{4a10e010-0000-4000-9000-000000000010}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_MoveSt04
+// Przejazd st.3 -> st.4 z testem wytrzymalosci desek
+// =============================================================
+//
+// Stacja 4 bada JADACA palete - transporter nie staje pod
+// rolkami. Przebieg:
+//
+//   0   jedziemy, czekamy na czujnik wjazdu IN3
+//   10  odstep tSt04_EntryToPress, zeby paleta weszla pod rolki
+//   20  schodza dociski GORNE
+//   30  dochodza DOLNE (tSt04_UpToLo pozniej), trwa test,
+//       czekamy na czujnik konca testu IN4
+//   40  dociski cofniete, paleta dojezdza tSt04_StopDelay i stoi
+//
+// Falownik 3 (same rolki dociskowe) jest zablokowany w
+// axDriveEnabled - to nie jest transporter.
+
+// Transportery obu stacji jada przez CALY test. Paleta jest
+// dluga i przy wjezdzie lezy jeszcze na stacji 3.
+axRunReq[10] := TRUE;
+axRunReq[4]  := TRUE;
+
+// Domyslnie krok jest wewnetrzny - nIdx zostaje na 3
+xHoldIdx := TRUE;
+
+
+CASE nSub OF
+
+	0:
+		sPhase := 'st.3->4 jazda, czekam na czujnik wjazdu (IN3)';
+		xWaitSensor := TRUE;
+		xSensorOK   := xPal_St04In;
+		IF xAdvance THEN nSub := 10; END_IF
+
+	10:
+		sPhase := 'st.4 paleta wchodzi pod rolki - odstep';
+		tThisStep := tSt04_EntryToPress;
+		IF xAdvance THEN nSub := 20; END_IF
+
+	20:
+		sPhase := 'st.4 dociski gorne schodza na deski';
+		xSt04_UpExt := TRUE;	xSt04_UpRet := FALSE;
+		tThisStep := tSt04_UpToLo;
+		IF xAdvance THEN nSub := 30; END_IF
+
+	30:
+		sPhase := 'st.4 TEST - czekam na czujnik konca testu (IN4)';
+		xSt04_UpExt := TRUE;	xSt04_UpRet := FALSE;
+		xSt04_LoExt := TRUE;	xSt04_LoRet := FALSE;
+		xWaitSensor := TRUE;
+		xSensorOK   := xPal_St04End;
+		IF xAdvance THEN nSub := 40; END_IF
+
+	40:
+		sPhase := 'st.4 koniec testu - dociski cofniete, dojazd';
+		xSt04_UpExt := FALSE;	xSt04_UpRet := TRUE;
+		xSt04_LoExt := FALSE;	xSt04_LoRet := TRUE;
+		tThisStep := tSt04_StopDelay;
+		xHoldIdx  := FALSE;
+
+END_CASE
+
+
+// Bezpiecznik: czujnik konca testu zdejmuje dociski od razu,
+// nie czekajac na przejscie kroku. Rolki nie maja prawa jechac
+// dalej po palecie, ktora juz wyszla spod nich.
+IF xPal_St04End AND (nSub = 30) THEN
+	xSt04_UpExt := FALSE;	xSt04_UpRet := TRUE;
+	xSt04_LoExt := FALSE;	xSt04_LoRet := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Outputs" Id="{4a10e008-0000-4000-9000-00000000e008}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Outputs
+// Cewki -> wyjscia
+// =============================================================
+//
+// CALE mapowanie zaworow siedzi tutaj i tylko tutaj. Jesli
+// ktores przypisanie okaze sie odwrotne, poprawka jest w jednej
+// linii, a nie w sekwencji.
+//
+// xCylEnable = FALSE zdejmuje cewki cylindrow linii - wtedy
+// test sprawdza same transportery.
+//
+// NIE dziala jednak wtedy, gdy pracuje ktoras krzywka. Szczeki
+// sztaplarki i desztaplarki trzymaja wtedy stos, a zdjecie ich
+// cewek razem z reszta po prostu by go upuscilo.
+
+IF NOT xCylEnable AND NOT START_DESTACK AND NOT START_STACK THEN
+	ACT_ClearCoils();
+END_IF
+
+
+// -------------------------------------------------------------
+// STACJA 3 - SZCZEKI DESZTAPLARKI
+// -------------------------------------------------------------
+
+GVL.OUTPUTS[14]	:= xSt03_JawClose;		// zamykanie
+GVL.OUTPUTS[15]	:= xSt03_JawOpen;		// otwieranie
+
+
+// -------------------------------------------------------------
+// STACJA 4 - DOCISKI
+// -------------------------------------------------------------
+//
+// Obie grupy gornych chodza razem: [7]/[2] to zewnetrzne
+// i srodkowa, [5]/[6] to srodkowe.
+
+GVL.OUTPUTS[7]	:= xSt04_UpExt;
+GVL.OUTPUTS[2]	:= xSt04_UpRet;
+GVL.OUTPUTS[5]	:= xSt04_UpExt;
+GVL.OUTPUTS[6]	:= xSt04_UpRet;
+
+GVL.OUTPUTS[4]	:= xSt04_LoExt;
+GVL.OUTPUTS[3]	:= xSt04_LoRet;
+
+
+// -------------------------------------------------------------
+// STACJA 5
+// -------------------------------------------------------------
+//
+// [7,2] wysuwanie blokady, [7,1] opuszczanie blokady
+// [6,2] podnoszenie szczek, [6,1] opuszczanie szczek
+// [1..3,1] TRUE = szczeki zamkniete
+
+GVL.FestoValves_1[7,2]	:= xSt05_BlockExt;
+GVL.FestoValves_1[7,1]	:= xSt05_BlockRet;
+
+GVL.FestoValves_1[6,2]	:= xSt05_LiftUp;
+GVL.FestoValves_1[6,1]	:= xSt05_LiftDown;
+
+GVL.FestoValves_1[1,1]	:= xSt05_JawClose;
+GVL.FestoValves_1[2,1]	:= xSt05_JawClose;
+GVL.FestoValves_1[3,1]	:= xSt05_JawClose;
+
+
+// Silowniki rozrywajace. NUMER ZAWORU NIE JEST NUMEREM
+// SILOWNIKA - stad ta tabela zamiast petli.
+GVL.FestoValves_2[4,2]	:= axSt05_PullUp[1];
+GVL.FestoValves_2[4,1]	:= axSt05_PullDown[1];
+GVL.FestoValves_2[3,2]	:= axSt05_PullUp[2];
+GVL.FestoValves_2[3,1]	:= axSt05_PullDown[2];
+GVL.FestoValves_2[1,2]	:= axSt05_PullUp[3];
+GVL.FestoValves_2[1,1]	:= axSt05_PullDown[3];
+GVL.FestoValves_2[2,2]	:= axSt05_PullUp[4];
+GVL.FestoValves_2[2,1]	:= axSt05_PullDown[4];
+GVL.FestoValves_2[5,2]	:= axSt05_PullUp[5];
+GVL.FestoValves_2[5,1]	:= axSt05_PullDown[5];
+GVL.FestoValves_2[6,2]	:= axSt05_PullUp[6];
+GVL.FestoValves_2[6,1]	:= axSt05_PullDown[6];
+
+
+// -------------------------------------------------------------
+// ROLKI PODNOSZONE
+// -------------------------------------------------------------
+
+GVL.OUTPUTS[11]	:= xSt08_Up;
+GVL.OUTPUTS[13]	:= xSt08_Down;
+GVL.OUTPUTS[10]	:= xSt10_Up;
+GVL.OUTPUTS[12]	:= xSt10_Down;
+
+
+// -------------------------------------------------------------
+// STACJA 11 - SZCZEKI SZTAPLARKI
+// -------------------------------------------------------------
+
+GVL.OUTPUTS[9]	:= xSt11_JawClose;
+GVL.OUTPUTS[8]	:= xSt11_JawOpen;
+
+
+// -------------------------------------------------------------
+// HAMULCE KRZYWEK
+// -------------------------------------------------------------
+//
+// TRUE = hamulec ROZLACZONY, mozna jechac.
+// FALSE = hamulec ZALOZONY - i taki jest stan bez zasilania,
+// wiec zanik napiecia trzyma wozek, a nie go puszcza.
+//
+// Opoznienie zalozenia (1 s 900 ms po bicie stopu) siedzi
+// w FB_CamAxis - silnik hamuje wlasna rampa 2 s.
+
+GVL.OUTPUTS[16]	:= xBrakeDestack;
+GVL.OUTPUTS[17]	:= xBrakeStack;
+
+
+// -------------------------------------------------------------
+// DOWOD, ZE TO SIE WYKONALO
+// -------------------------------------------------------------
+
+nOutWrites := nOutWrites + 1;
+
+nCoilsOn := 0;
+
+IF GVL.OUTPUTS[2]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[3]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[4]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[5]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[6]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[7]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[8]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[9]  THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[10] THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[11] THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[12] THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[13] THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[14] THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[15] THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[16] THEN nCoilsOn := nCoilsOn + 1; END_IF
+IF GVL.OUTPUTS[17] THEN nCoilsOn := nCoilsOn + 1; END_IF
+
+FOR i := 1 TO 8 DO
+	IF GVL.FestoValves_1[i,1] THEN nCoilsOn := nCoilsOn + 1; END_IF
+	IF GVL.FestoValves_1[i,2] THEN nCoilsOn := nCoilsOn + 1; END_IF
+	IF GVL.FestoValves_2[i,1] THEN nCoilsOn := nCoilsOn + 1; END_IF
+	IF GVL.FestoValves_2[i,2] THEN nCoilsOn := nCoilsOn + 1; END_IF
+END_FOR
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_ResetDrives" Id="{4a10e005-0000-4000-9000-00000000e005}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_ResetDrives
+// Kasowanie bledow wszystkich falownikow
+// =============================================================
+//
+// Dziala na ZBOCZE bitu xCmdResetDrives. Blok napedu wystawia
+// impuls 200 ms na bicie 7 ControlWord - falownik NORD kasuje
+// blad zboczem, nie poziomem.
+//
+// Kasujemy WSZYSTKIE napedy, takze te zablokowane w
+// axDriveEnabled: skasowanie bledu niczego nie uruchamia,
+// a chcemy widziec czysty obraz maszyny.
+//
+// Bit zdejmujemy sami, zeby nie trzeba bylo tego robic recznie
+// w podgladzie online.
+
+// -------------------------------------------------------------
+// KASOWANIE RECZNE - bitem
+// -------------------------------------------------------------
+
+rtrgResetDrv(CLK := xCmdResetDrives);
+
+IF rtrgResetDrv.Q THEN
+
+	FOR i := 1 TO cNumDrives DO
+		fbNord[i].M_Reset();
+	END_FOR
+
+	xCmdResetDrives	:= FALSE;
+	xResetFailed	:= FALSE;
+
+END_IF
+
+
+// -------------------------------------------------------------
+// KASOWANIE AUTOMATYCZNE - po wcisnieciu START
+// -------------------------------------------------------------
+//
+// Kasujemy tylko te napedy, ktore faktycznie zglaszaja blad,
+// i tylko ograniczona liczbe razy. Bez tego limitu maszyna
+// dobijalaby sie w nieskonczonosc do napedu, ktory ma realny
+// powod stac - a to wygladaloby jak "nic sie nie dzieje".
+
+IF NOT xResetInProgress THEN
+	RETURN;
+END_IF
+
+
+// Czysto - konczymy
+IF NOT xAnyDriveFault THEN
+	xResetInProgress	:= FALSE;
+	nResetTries			:= 0;
+	tonResetGap(IN := FALSE);
+	RETURN;
+END_IF
+
+
+// Proby wyczerpane - dalej decyduje czlowiek
+IF nResetTries >= cResetTries THEN
+	xResetInProgress	:= FALSE;
+	xResetFailed		:= TRUE;
+	tonResetGap(IN := FALSE);
+	RETURN;
+END_IF
+
+
+// Pierwsza proba od razu, kolejne co tResetGap
+IF nResetTries = 0 THEN
+	xDoResetPulse := TRUE;
+ELSE
+	tonResetGap(IN := TRUE, PT := tResetGap);
+	xDoResetPulse := tonResetGap.Q;
+END_IF
+
+IF NOT xDoResetPulse THEN
+	RETURN;
+END_IF
+
+tonResetGap(IN := FALSE);
+
+
+FOR i := 1 TO cNumDrives DO
+	IF axDrvFault[i] THEN
+		fbNord[i].M_Reset();
+	END_IF
+END_FOR
+
+nResetTries := nResetTries + 1;
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Sequence" Id="{4a10e002-0000-4000-9000-00000000e002}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Sequence
+// Wirtualna paleta idaca trasa maszyny
+// =============================================================
+//
+// Paleta ZATRZYMUJE SIE na kazdej stacji. Cykl wyglada tak:
+//
+//   przejazd  para transporterow pracuje przez tStepTime,
+//             potem OBA staja
+//   praca     transportery stoja, dziala mechanika stacji
+//             (kazdy ruch silownika przez tCylTime)
+//   i dalej
+//
+// Czujnikow nie ma, wiec o zakonczeniu kazdej fazy decyduje
+// czas. Po dolozeniu czujnikow te czasowki zastapi warunek
+// "paleta na pozycji" i "silownik w polozeniu".
+//
+// TRASA:
+//   poz. 1..11   dobre:   1-2-3-4-5-6-7-8-11-12-13
+//   poz. 12..16  odrzut:  8-10-14-15-16  (8 -> 10 lancuchem)
+//
+// Przydzial falownikow do stacji:
+//   st.1  -> 8     st.5  -> 5     st.9  -> 7      st.13 -> 15
+//   st.2  -> 9     st.6  -> 6     st.10 -> 16     st.14 -> 17
+//   st.3  -> 10    st.7  -> 11    st.11 -> 13     st.15 -> 18
+//   st.4  -> 4     st.8  -> 12    st.12 -> 14     st.16 -> 19
+
+
+// Zadanie ruchu kasujemy w kazdym cyklu - faza ustawia je od nowa
+FOR i := 1 TO 20 DO
+	axRunReq[i] := FALSE;
+END_FOR
+
+tThisStep := tCylTime;
+
+
+// -------------------------------------------------------------
+// START I STOP
+// -------------------------------------------------------------
+
+rtrgStart(CLK := START_TEST);
+
+IF rtrgStart.Q THEN
+
+	nIdx	:= 0;			// najpierw sprowadzamy mechanike
+	nSub	:= 0;
+	xMoving	:= FALSE;
+	tonStep(IN := FALSE);
+
+	xResetFailed := FALSE;
+	nResetTries  := 0;
+	tonResetGap(IN := FALSE);
+
+	IF xAutoResetOnStart AND xAnyDriveFault THEN
+		xResetInProgress := TRUE;
+	END_IF
+
+END_IF
+
+
+IF NOT START_TEST THEN
+	tonStep(IN := FALSE);
+	sPhase := 'STOP - START_TEST = FALSE';
+	ACT_ClearCoils();
+	RETURN;
+END_IF
+
+
+IF NOT xSafetyOK THEN
+	tonStep(IN := FALSE);
+	sPhase := 'STOP - brak zezwolenia bezpieczenstwa';
+	RETURN;
+END_IF
+
+
+IF xResetInProgress THEN
+	tonStep(IN := FALSE);
+	sPhase := CONCAT('kasowanie bledow falownikow - proba ',
+	                 INT_TO_STRING(nResetTries));
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// TRYB RECZNY POJEDYNCZEGO SILOWNIKA
+// -------------------------------------------------------------
+//
+// Ma pierwszenstwo przed sekwencja - transportery stoja,
+// bo axRunReq zostalo wykasowane na gorze.
+
+IF nManCyl <> 0 THEN
+	ACT_ManualCyl();
+	tonStep(IN := FALSE);
+	RETURN;
+END_IF
+
+
+// -------------------------------------------------------------
+// ZMIANA KROKU
+// -------------------------------------------------------------
+//
+// Kazdy krok dostaje czasowke od zera i wlasne uzbrojenie
+// czujnika. Bez tego krok dziedziczylby resztke po poprzednim.
+
+xNewStep := (nIdx <> nIdxOld) OR (nSub <> nSubOld) OR (xMoving <> xMovingOld);
+
+nIdxOld		:= nIdx;
+nSubOld		:= nSub;
+xMovingOld	:= xMoving;
+
+IF xNewStep THEN
+	tonStep(IN := FALSE);
+	xStepArmed   := FALSE;
+	xStepTimeout := FALSE;
+END_IF
+
+
+// Krok sam zglosi, na co czeka. Kasujemy co cykl.
+xWaitSensor := FALSE;
+xSensorOK   := FALSE;
+
+
+// -------------------------------------------------------------
+// FAZA
+// -------------------------------------------------------------
+
+IF xMoving THEN
+	ACT_Move();
+ELSE
+	ACT_Work();
+END_IF
+
+
+// -------------------------------------------------------------
+// KONIEC KROKU: CZUJNIK ALBO WATCHDOG
+// -------------------------------------------------------------
+//
+// Krok czujnikowy konczy sie czujnikiem. Czasowka pracuje wtedy
+// tylko jako watchdog - jesli to ONA zdecyduje, zapala sie
+// xStepTimeout i wiadomo, ze czujnik nie przyszedl.
+//
+// Czujnik musi byc najpierw WOLNY (xStepArmed). Inaczej krok
+// zaliczylby stan sprzed przejazdu albo czujnik zwarty na stale.
+
+IF xUseSensors AND xWaitSensor THEN
+	tThisStep := tMoveTimeout;
+END_IF
+
+tonStep(IN := TRUE, PT := tThisStep);
+xAdvance := tonStep.Q;
+
+// Watchdog wylaczony - czasowka nie ma prawa zakonczyc kroku
+// czujnikowego. Krok stoi, dopoki nie przyjdzie sam czujnik.
+IF xUseSensors AND xWaitSensor AND NOT xStepWatchdog THEN
+	xAdvance := FALSE;
+END_IF
+
+IF xUseSensors AND xWaitSensor AND xAdvance THEN
+	xStepTimeout := TRUE;
+	nTimeouts    := nTimeouts + 1;
+END_IF
+
+IF NOT xSensorOK THEN
+	xStepArmed := TRUE;
+END_IF
+
+IF xUseSensors AND xWaitSensor AND xStepArmed AND xSensorOK THEN
+	xAdvance := TRUE;
+END_IF
+
+IF xAdvance THEN
+	tonStep(IN := FALSE);
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_TestFeed" Id="{4a10e012-0000-4000-9000-000000000012}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_TestFeed
+// Proba calosciowa: st.1 -> desztaplarka -> stacja 4
+// =============================================================
+//
+// Waska sciezka transportu na czas proby. NIE korzysta z tabeli
+// trasy w ACT_Sequence - wozi tylko tam, gdzie trzeba:
+//
+//   1. dowozi stos ze stacji 1 na stacje 3 (czujnik IN2),
+//   2. czeka, az desztaplarka zwolni palete,
+//   3. wywozi ja przez stacje 4 robiac test dociskow,
+//   4. ZATRZYMUJE ja na koncu stacji 4 - do recznego zabrania.
+//
+// Napedy: st.1 -> 8, st.2 -> 9, st.3 -> 10, st.4 -> 4.
+// Rolki dociskowe (falownik 3) zostaja wylaczone.
+//
+// Cewki dociskow przepisujemy CO CYKL - ACT_ClearCoils zeruje
+// je przy zdjetym START_TEST, wiec krok, ktory ich nie odswieza,
+// stracilby sterowanie zaworem.
+
+
+xFeedNewStep := (nFeedStep <> nFeedStepOld);
+nFeedStepOld := nFeedStep;
+
+IF xFeedNewStep THEN
+	tonFeedStep(IN := FALSE);
+	xFeedArmed := FALSE;
+END_IF
+
+tonFeedStep(IN := TRUE, PT := tFeedStep);
+xFeedAdvance := tonFeedStep.Q AND NOT xFeedNewStep;
+
+
+// Tor B ma WLASNA czasowke i wlasne uzbrojenie czujnika -
+// inaczej dwie palety deptalyby sobie po jednym liczniku.
+//
+// UWAGA NA ZBOCZE KROKU MIEDZY TORAMI.
+// Flagi xOutNewStep / xOutAdvance sa liczone TU, na poczatku
+// akcji. Jesli inny tor wpisze torowi B numer kroku PO tym
+// miejscu, krok wykona sie jeszcze w tym samym cyklu - ze stara
+// flaga xOutAdvance, odziedziczona po kroku 0, gdzie czasowka
+// dawno wybila. Krok przeskoczylby natychmiast.
+//
+// Wlasnie tak ginal przejazd ze stacji 5 na 6: krok 180 trwal
+// JEDEN CYKL zadania, naped 5 dostawal zadanie na 10 ms i tor
+// szedl dalej, jakby paleta juz przejechala.
+//
+// Dlatego zaden tor nie wpisuje numeru kroku innemu torowi.
+// Zglasza tylko zadanie (xOutStart), a tor podnosi je SAM,
+// w swoim kroku 0 - i wtedy pierwszy cykl nowego kroku jest
+// juz zwyklym zboczem, z wyzerowana czasowka.
+
+xOutNewStep := (nOutStep <> nOutStepOld);
+nOutStepOld := nOutStep;
+
+IF xOutNewStep THEN
+	tonOutStep(IN := FALSE);
+	xOutArmed := FALSE;
+END_IF
+
+tonOutStep(IN := TRUE, PT := tOutStep);
+xOutAdvance := tonOutStep.Q AND NOT xOutNewStep;
+
+
+xOut2NewStep := (nOut2Step <> nOut2StepOld);
+nOut2StepOld := nOut2Step;
+
+IF xOut2NewStep THEN
+	tonOut2Step(IN := FALSE);
+	xOut2Armed := FALSE;
+END_IF
+
+tonOut2Step(IN := TRUE, PT := tOut2Step);
+xOut2Advance := tonOut2Step.Q AND NOT xOut2NewStep;
+
+
+xOut3NewStep := (nOut3Step <> nOut3StepOld);
+nOut3StepOld := nOut3Step;
+
+IF xOut3NewStep THEN
+	tonOut3Step(IN := FALSE);
+	xOut3Armed := FALSE;
+END_IF
+
+tonOut3Step(IN := TRUE, PT := tOut3Step);
+xOut3Advance := tonOut3Step.Q AND NOT xOut3NewStep;
+
+
+// Czas pchania palety do blokady stacji 5 - liczony od wejscia
+// w krok 80, niezalezny od czasowki kroku.
+tonSt05Push(IN := (nFeedStep = 80), PT := tSt05_Push);
+
+// Ile blokada stacji 5 stoi juz OPUSZCZONA. Nie ma na niej
+// czujnika, wiec liczymy od zdjecia komendy wysuwu - tyle, ile
+// dajemy kazdemu silownikowi na dojscie do polozenia.
+tonSt05BlockDown(IN := NOT xFeed05_Block, PT := tCylTime);
+
+// Od IN7 na stacji 8 do opuszczenia rolek pod paleta NOK.
+// Liczona OSOBNO od tFeedSt08Stop - to sa dwie rozne rzeczy,
+// wiec MOGA byc w dowolnej kolejnosci i dowolnie dalekie.
+//
+// Odliczamy od FLAGI OBECNOSCI, a nie od numeru kroku. Krok 215
+// trwa tylko tFeedSt08Stop; przy dluzszym tSt08_DropDelay timer
+// nie zdazyl dobiec do konca i zerowal sie przy przejsciu do
+// kroku 218. Rolki nie schodzily wcale, a to, ze pierwsza paleta
+// wygladala dobrze, robil krok 220 toru B3 - i tylko wtedy, gdy
+// lancuch byl akurat wolny.
+tonSt08Drop(IN := xSt08_AtStation, PT := tSt08_DropDelay);
+
+
+rtrgFeedStart(CLK := START_FEED);
+
+IF rtrgFeedStart.Q THEN
+	nFeedStep  := 0;
+
+	// Tor B tez od zera - inaczej po ponownym starcie dokanczal
+	// by trase palety, ktorej juz tam nie ma.
+	nOutStep   := 0;
+	nOut2Step  := 0;
+	nOut3Step  := 0;
+	xSt05_Done := FALSE;
+	xOutStart  := FALSE;
+	xOut2Start := FALSE;
+	xOut3Start := FALSE;
+	xSt08_RollDown  := FALSE;
+	xSt08_AtStation := FALSE;
+END_IF
+
+
+// Falowniki po zatrzymaniu runtime'u zglaszaja blad komunikacji
+// i same z niego nie wyjda. Kasujemy go przy starcie, tak samo
+// jak robi to START_TEST - inaczej za kazdym razem trzeba by
+// pamietac o xCmdResetDrives.
+IF rtrgFeedStart.Q AND xAutoResetOnStart AND xAnyDriveFault THEN
+	xResetInProgress := TRUE;
+	nResetTries      := 0;
+	xResetFailed     := FALSE;
+END_IF
+
+
+// Domyslnie: cala mechanika w polozeniu spoczynkowym.
+// Krok, ktory czegos potrzebuje, podaje to sam.
+xFeedPressOn   := FALSE;
+xFeedPressLoOn := FALSE;
+xFeed05_Block  := FALSE;
+xFeed05_Lift   := FALSE;
+xFeed05_Jaws   := FALSE;
+xFeed05_Pull   := FALSE;
+tFeedStep      := tSt04_EntryToPress;
+tOutStep       := tCylTime;
+tOut2Step      := tCylTime;
+tOut3Step      := tCylTime;
+
+// Rolki domyslnie W GORZE - transport wzdluz. Tylko przejazd
+// lancuchem opuszcza je swiadomie.
+xFeedRoll08Up  := TRUE;
+xFeedRoll10Up  := TRUE;
+
+
+IF NOT START_FEED THEN
+	sFeedPhase := 'DOWOZ - stop, START_FEED = FALSE';
+END_IF
+
+
+IF START_FEED AND xSafetyOK THEN
+
+	CASE nFeedStep OF
+
+	0:
+		sFeedPhase := 'DOWOZ 0 czekam na potwierdzenie palet na st.1';
+
+		// Bit SAM sie zdejmuje po przyjeciu. Dzieki temu po
+		// oproznieniu stosu maszyna nie rusza w pustke, tylko
+		// czeka na kolejne potwierdzenie operatora.
+		//
+		// Jesli IN2 juz widzi stos, to on STOI na stacji 3
+		// i nie ma czego dowozic - idziemy od razu do pracy
+		// desztaplarki. "Juz u celu" nie jest powodem do
+		// czekania.
+		IF xSt01_StackReady AND NOT xPal_St03 THEN
+			xSt01_StackReady := FALSE;
+			nFeedStep        := 10;
+		END_IF
+
+		IF xSt01_StackReady AND xPal_St03 THEN
+			sFeedPhase       := 'DOWOZ 0 stos JUZ na st.3 - pomijam dowoz';
+			xSt01_StackReady := FALSE;
+			nFeedStep        := 20;
+		END_IF
+
+	10:
+		sFeedPhase := 'DOWOZ 1 stos jedzie st.1 -> st.3, czekam na IN2';
+		axRunReq[8]  := TRUE;
+		axRunReq[9]  := TRUE;
+		axRunReq[10] := TRUE;
+
+		IF NOT xPal_St03 THEN xFeedArmed := TRUE; END_IF
+
+		IF xPal_St03 AND NOT xFeedArmed THEN
+			sFeedPhase := 'DOWOZ 1 IN2 JUZ zaslonony - odslon i zaslon ponownie';
+		END_IF
+
+		IF xFeedArmed AND xPal_St03 THEN nFeedStep := 15; END_IF
+
+	15:
+		// Dobieg po czujniku - stos dojezdza pod szczeki.
+		// Przy tFeedSt03Stop = 0 krok trwa jeden cykl zadania.
+		sFeedPhase := 'DOWOZ 1b dobieg stosu po IN2';
+		axRunReq[9]  := TRUE;
+		axRunReq[10] := TRUE;
+		tFeedStep    := tFeedSt03Stop;
+
+		IF xFeedAdvance THEN nFeedStep := 20; END_IF
+
+	20:
+		// Transportery STOJA - desztaplarka pracuje na stosie.
+		sFeedPhase := 'DOWOZ 2 stos na st.3 - czekam na zwolnienie palety';
+
+		IF xDe_PalletReleased THEN nFeedStep := 30; END_IF
+
+	30:
+		sFeedPhase := 'DOWOZ 3 paleta jedzie na st.4, czekam na IN3';
+
+		// Paleta zaslaniajaca JUZ czujnik konca stacji 4 minela
+		// wjazd pod rolki. Czekanie na IN3 bylo by czekaniem na
+		// zdarzenie, ktore sie nie powtorzy - jedziemy dalej.
+		IF xFeedNewStep AND xPal_St04End THEN
+			sFeedPhase := 'DOWOZ 3 paleta JUZ na koncu st.4 - pomijam docisk';
+			nFeedStep  := 75;
+		END_IF
+
+		axRunReq[10] := TRUE;
+		axRunReq[4]  := TRUE;
+
+		IF NOT xPal_St04In THEN xFeedArmed := TRUE; END_IF
+
+		IF xPal_St04In AND NOT xFeedArmed THEN
+			sFeedPhase := 'DOWOZ 3 IN3 JUZ zaslonony - odslon i zaslon ponownie';
+		END_IF
+
+		IF xFeedArmed AND xPal_St04In THEN nFeedStep := 40; END_IF
+
+	40:
+		sFeedPhase := 'ST.4 wjazd pod rolki - odstep przed dociskiem';
+		axRunReq[10] := TRUE;
+		axRunReq[4]  := TRUE;
+		axRunReq[3]  := TRUE;   // rolki dociskowe
+		tFeedStep    := tSt04_EntryToPress;
+
+		IF xFeedAdvance THEN nFeedStep := 50; END_IF
+
+	50:
+		sFeedPhase := 'ST.4 dociski gorne schodza na deski';
+		axRunReq[10] := TRUE;
+		axRunReq[4]  := TRUE;
+		axRunReq[3]  := TRUE;   // rolki dociskowe
+		xFeedPressOn := TRUE;
+		tFeedStep    := tSt04_UpToLo;
+
+		IF xFeedAdvance THEN nFeedStep := 60; END_IF
+
+	60:
+		sFeedPhase := 'ST.4 TEST - czekam na koniec testu (IN4)';
+		axRunReq[10]   := TRUE;
+		axRunReq[4]    := TRUE;
+		axRunReq[3]  := TRUE;   // rolki dociskowe
+		xFeedPressOn   := TRUE;
+		xFeedPressLoOn := TRUE;
+
+		IF NOT xPal_St04End THEN xFeedArmed := TRUE; END_IF
+
+		IF xPal_St04End AND NOT xFeedArmed THEN
+			sFeedPhase := 'ST.4 IN4 JUZ zaslonony - odslon i zaslon ponownie';
+		END_IF
+
+		IF xFeedArmed AND xPal_St04End THEN nFeedStep := 70; END_IF
+
+	70:
+		// Dociski juz cofniete - kroki wyzej ich nie podaja.
+		sFeedPhase := 'ST.4 koniec testu - dociski cofniete, dojazd';
+		axRunReq[4] := TRUE;
+		tFeedStep   := tSt04_StopDelay;
+
+		IF xFeedAdvance THEN nFeedStep := 75; END_IF
+
+	75:
+		// BRAMKA MIEDZY TORAMI. Stacja 5 to zasob wspolny:
+		// jej transporter i blokada obsluguja raz palete
+		// wyjezdzajaca, raz wjezdzajaca. Wjazd moze ruszyc
+		// dopiero wtedy, gdy poprzednia paleta zjechala ze
+		// stacji 5 - czyli tor B jest wolny (0) albo minal
+		// juz przejazd na stacje 6 (>= 200).
+		//
+		// Paleta czeka na koncu stacji 4, napedy stoja.
+		sFeedPhase := 'ST.4 koniec - czekam, az zwolni sie stacja 5';
+
+		IF (nOutStep = 0) OR (nOutStep >= 200) THEN
+			nFeedStep := 80;
+		END_IF
+
+	80:
+		// Blokada wysuwa sie RAZEM z ruszeniem palety ze stacji 4.
+		// To ona zatrzymuje palete na stacji 5 - nie ma tam
+		// czujnika, wiec musi czekac na palete, a nie odwrotnie.
+		// Napedy pracuja TYLKO przez tSt05_Push, a nie przez caly
+		// krok. Paleta opiera sie o blokade po kilku sekundach
+		// i od tej chwili transporter mieli pod stojaca paleta -
+		// tak przeciazylismy naped 5. Reszta kroku to juz tylko
+		// uspokojenie palety, z zatrzymanymi napedami.
+		sFeedPhase := 'ST.4 -> ST.5 przejazd, blokada juz wysunieta';
+		xFeed05_Block := TRUE;
+		tFeedStep   := tFeedToSt05;
+
+		IF NOT tonSt05Push.Q THEN
+			axRunReq[4] := TRUE;
+			axRunReq[5] := TRUE;
+		END_IF
+
+		IF tonSt05Push.Q THEN
+			sFeedPhase := 'ST.5 paleta na blokadzie - napedy staja';
+		END_IF
+
+		IF xFeedAdvance THEN nFeedStep := 100; END_IF
+
+
+	// -----------------------------------------------------
+	// STACJA 5 - TEST ROZRYWANIA
+	// -----------------------------------------------------
+	//
+	// Transportery STOJA. Kolejnosc wg zalozen: blokada,
+	// podniesienie szczek, chwyt, szesc silownikow rozrywajacych
+	// w gore i w dol, zwolnienie, opuszczenie blokady.
+	//
+	// Kazdy krok podaje SWOJ pelny stan cewek - przepisujemy je
+	// na dole akcji, w kazdym cyklu.
+
+	100:
+		// Paleta oparla sie o blokade. Transportery juz stoja,
+		// dajemy jej uspokoic sie, zanim ruszy mechanika.
+		sFeedPhase := 'ST.5 1/8 paleta na blokadzie - uspokojenie';
+		xFeed05_Block := TRUE;
+		tFeedStep     := tSt05_Settle;
+		IF xFeedAdvance THEN nFeedStep := 110; END_IF
+
+	110:
+		sFeedPhase := 'ST.5 2/8 szczeki ida w gore';
+		xFeed05_Block := TRUE;
+		xFeed05_Lift  := TRUE;
+		tFeedStep     := tCylTime;
+		IF xFeedAdvance THEN nFeedStep := 120; END_IF
+
+	120:
+		sFeedPhase := 'ST.5 3/8 szczeki zamykaja sie na deskach';
+		xFeed05_Block := TRUE;
+		xFeed05_Lift  := TRUE;
+		xFeed05_Jaws  := TRUE;
+		tFeedStep     := tCylTime;
+		IF xFeedAdvance THEN nFeedStep := 130; END_IF
+
+	130:
+		sFeedPhase := 'ST.5 4/8 ROZRYWANIE - silowniki ida w gore';
+		xFeed05_Block := TRUE;
+		xFeed05_Lift  := TRUE;
+		xFeed05_Jaws  := TRUE;
+		xFeed05_Pull  := TRUE;
+		tFeedStep     := tCylTime;
+		IF xFeedAdvance THEN nFeedStep := 140; END_IF
+
+	140:
+		sFeedPhase := 'ST.5 5/8 silowniki rozrywajace ida w dol';
+		xFeed05_Block := TRUE;
+		xFeed05_Lift  := TRUE;
+		xFeed05_Jaws  := TRUE;
+		tFeedStep     := tCylTime;
+		IF xFeedAdvance THEN nFeedStep := 150; END_IF
+
+	150:
+		sFeedPhase := 'ST.5 6/8 szczeki otwieraja sie';
+		xFeed05_Block := TRUE;
+		xFeed05_Lift  := TRUE;
+		tFeedStep     := tCylTime;
+		IF xFeedAdvance THEN nFeedStep := 160; END_IF
+
+	160:
+		sFeedPhase := 'ST.5 7/8 szczeki ida w dol';
+		xFeed05_Block := TRUE;
+		tFeedStep     := tCylTime;
+		IF xFeedAdvance THEN nFeedStep := 170; END_IF
+
+	170:
+		// PRZEKAZANIE PALETY TOROWI B.
+		//
+		// Tu konczy sie zadanie toru A. Paleta ma wolna droge
+		// (blokada opuszczona) i od tej chwili jedzie na stacje
+		// 16 SAMA, sekwencja nOutStep. Tor A wraca po nastepna.
+		//
+		// xSt05_Done to sygnal dla desztaplarki - na nim wydaje
+		// kolejna palete, nie czekajac na stacje 16.
+		//
+		// Jesli tor B jeszcze pracuje, paleta czeka tutaj:
+		// stoi na stacji 5 z opuszczona blokada, napedy staja.
+		sFeedPhase := 'ST.5 8/8 blokada opuszcza sie';
+		tFeedStep := tCylTime;
+
+		// Oddajemy palete tylko wtedy, gdy tor B1 jest wolny
+		// I stacja 7 pusta. Inaczej paleta zatrzymalaby sie
+		// gdzies miedzy 5 a 6 i czekala tam bez potrzeby.
+		xSt05_CanPass := (nOutStep = 0) AND NOT xPal_St07;
+
+		IF xFeedAdvance AND NOT xSt05_CanPass THEN
+			sFeedPhase := 'ST.5 gotowa - czekam, az zwolni sie droga na st.7';
+		END_IF
+
+		IF xFeedAdvance AND xSt05_CanPass AND (GVL_PERSIST.St03.Mem.nRemaining > 0) THEN
+			nFeedPallets := nFeedPallets + 1;
+			xOutStart    := TRUE;
+			xSt05_Done   := TRUE;
+			nFeedStep    := 20;
+		END_IF
+
+		IF xFeedAdvance AND xSt05_CanPass AND (GVL_PERSIST.St03.Mem.nRemaining <= 0) THEN
+			nFeedPallets := nFeedPallets + 1;
+			xOutStart    := TRUE;
+			xSt05_Done   := TRUE;
+			nFeedStep    := 0;
+		END_IF
+
+	END_CASE
+
+END_IF
+
+
+// =============================================================
+// TOR B - STACJA 5 -> 16
+// =============================================================
+//
+// Osobna sekwencja, wlasna czasowka (tOutStep / xOutAdvance)
+// i wlasne uzbrojenie czujnika (xOutArmed). Startuje ja tor A
+// w kroku 170, konczy sie zwolnieniem toru: nOutStep := 0.
+//
+// Czujniki mamy tylko na stacjach 7 (IN5), 8 (IN7) i 16
+// (IN10). Reszta odcinkow konczy sie czasowka - kazda ma
+// wlasna nazwe, zeby dalo sie ja dobrac osobno.
+//
+// Napedy toru B (5, 6, 11, 12, 7, 16..19) nie sa uzywane
+// przez tor A - jedynym zasobem wspolnym jest naped 5
+// i blokada stacji 5, rozdzielone bramka w kroku 75.
+
+IF NOT START_FEED THEN
+	sOutPhase := 'TOR B - stop, START_FEED = FALSE';
+END_IF
+
+IF START_FEED AND xSafetyOK THEN
+
+	CASE nOutStep OF
+
+	0:
+		sOutPhase := 'TOR B wolny - czekam na palete ze stacji 5';
+
+		IF xOutStart THEN
+			xOutStart := FALSE;
+			nOutStep  := 180;
+		END_IF
+
+	180:
+		sOutPhase := 'ST.5 -> ST.6 przejazd';
+
+		// Napedy i tak nie rusza, dopoki blokada nie opadnie -
+		// pilnuje tego warunek nadrzedny w ACT_ApplyDrives.
+		IF xSt05_BlockLock THEN
+			sOutPhase := 'ST.5 czekam na opuszczenie blokady';
+		END_IF
+
+		axRunReq[5] := TRUE;
+		axRunReq[6] := TRUE;
+		tOutStep   := tFeed5to6;
+		IF xOutAdvance THEN nOutStep := 200; END_IF
+
+	200:
+		// NIE WOLNO JECHAC W ZAJETE MIEJSCE.
+		//
+		// Dopoki czujnik jest zaslonony, a my nie jestesmy jeszcze
+		// uzbrojeni, stoi tam CUDZA paleta - napedy musza stac.
+		// Bez tego warunku transporter pchal palete w te, ktora
+		// czekala na stacji 7, az do zderzenia; przy okazji
+		// wykladalo to falownik stacji 5.
+		sOutPhase := 'ST.6 -> ST.7 przejazd, czekam na IN5';
+
+		// Przy 12 s w kroku 180 paleta potrafi dojechac na stacje 7
+		// jeszcze przed wejsciem w ten krok. Stacja 7 byla pusta
+		// w chwili przekazania (xSt05_CanPass), wiec zasloniety
+		// czujnik NA WEJSCIU w krok to NASZA paleta - jest u celu,
+		// nie ma na co czekac.
+		IF xOutNewStep AND xPal_St07 THEN
+			sOutPhase  := 'ST.7 paleta juz dojechala w kroku 180';
+			nOutStep   := 205;
+		END_IF
+
+		IF NOT xPal_St07 OR xOutArmed THEN
+			axRunReq[6]  := TRUE;
+			axRunReq[11] := TRUE;
+		END_IF
+
+		IF NOT xPal_St07 THEN xOutArmed := TRUE; END_IF
+
+		IF xPal_St07 AND NOT xOutArmed THEN
+			sOutPhase := 'ST.7 ZAJETA - stoje, czekam az sie zwolni';
+		END_IF
+
+		IF xOutArmed AND xPal_St07 THEN nOutStep := 205; END_IF
+
+	205:
+		// Paleta LEZY na stacji 7, napedy staja. Tor B1 zwalnia
+		// sie dopiero, gdy odbierze ja tor B2 - transporter
+		// stacji 7 jest wspolny, wiec ruszajac nim po nastepna
+		// palete pchnelibysmy te, ktora tu stoi.
+		sOutPhase := 'ST.7 paleta czeka - tor B2 zajety';
+
+		IF (nOut2Step = 0) AND ((nOut3Step = 0) OR (nOut3Step >= 240)) THEN
+			sOutPhase  := 'ST.7 oddaje palete torowi B2';
+			xOut2Start := TRUE;
+			nOutStep   := 0;
+		END_IF
+
+	END_CASE
+
+END_IF
+
+
+// =============================================================
+// TOR B2 - STACJA 7 -> STACJA 8
+// =============================================================
+//
+// Krotki odcinek miedzy dwoma czujnikami: IN5 (st.7) i IN7
+// (st.8). Wydzielony osobno, bo to on decyduje, kiedy stacja 7
+// sie zwalnia i moze przyjac nastepna palete.
+//
+// Ruszy dopiero, gdy stacja 8 jest pusta - czyli tor B3 wolny.
+
+IF START_FEED AND xSafetyOK THEN
+
+	CASE nOut2Step OF
+
+	0:
+		sOut2Phase := 'TOR B2 wolny - stacja 7 moze oddac palete';
+
+		IF xOut2Start THEN
+			xOut2Start := FALSE;
+			nOut2Step  := 210;
+		END_IF
+
+	210:
+		// Jak w kroku 200: zaslonony czujnik przy nieuzbrojonym
+		// kroku znaczy CUDZA paleta na stacji 8 - stoimy.
+		sOut2Phase := 'ST.7 -> ST.8 przejazd, czekam na IN7';
+
+		IF NOT xPal_St08 OR xOut2Armed THEN
+			axRunReq[11] := TRUE;
+			axRunReq[12] := TRUE;
+		END_IF
+
+		IF NOT xPal_St08 THEN xOut2Armed := TRUE; END_IF
+
+		IF xPal_St08 AND NOT xOut2Armed THEN
+			sOut2Phase := 'ST.8 ZAJETA - stoje, czekam az sie zwolni';
+		END_IF
+
+		IF xOut2Armed AND xPal_St08 THEN nOut2Step := 215; END_IF
+
+	215:
+		// Dobieg po IN7 - paleta dojezdza na srodek stacji 8,
+		// zeby rolki mialy pod nia zejsc, a lancuch ja zabral.
+		sOut2Phase := 'ST.8 dobieg po IN7';
+		axRunReq[11] := TRUE;
+		axRunReq[12] := TRUE;
+		tOut2Step    := tFeedSt08Stop;
+
+		// IN7 potwierdzone - paleta jest na stacji 8. Od tej chwili
+		// biegnie odliczanie do opuszczenia rolek, niezaleznie od
+		// tego, jak dlugo trwa ten krok i co bedzie dalej.
+		xSt08_AtStation := TRUE;
+
+		IF xOut2Advance THEN nOut2Step := 218; END_IF
+
+	218:
+		// Paleta stoi na srodku stacji 8, napedy staja. Czekamy,
+		// az tor B3 sie zwolni - dopiero wtedy rolki moga zejsc
+		// i lancuch ja zabrac.
+		sOut2Phase := 'ST.8 paleta czeka - tor B3 zajety';
+
+		IF nOut3Step = 0 THEN
+			sOut2Phase := 'ST.8 oddaje palete torowi B3';
+			xOut3Start := TRUE;
+			nOut2Step  := 0;
+		END_IF
+
+	END_CASE
+
+END_IF
+
+
+// =============================================================
+// TOR B3 - STACJA 8 -> LANCUCH -> 10 -> 14 -> 15 -> 16
+// =============================================================
+//
+// Najdluzszy odcinek, bez czujnikow posrednich. Dopoki nim
+// jedzie paleta, stacja 8 jest zajeta i tor B2 nie rusza.
+
+IF START_FEED AND xSafetyOK THEN
+
+	CASE nOut3Step OF
+
+	0:
+		sOut3Phase := 'TOR B3 wolny - stacja 8 moze oddac palete';
+
+		IF xOut3Start THEN
+			xOut3Start := FALSE;
+			nOut3Step  := 220;
+		END_IF
+
+	220:
+		// Paleta ma lec na lancuchu, wiec rolki OBU stacji schodza.
+		sOut3Phase := 'ST.8 rolki 8 i 10 ida w dol - droga dla lancucha';
+		xFeedRoll08Up := FALSE;
+		xFeedRoll10Up := FALSE;
+		tOut3Step     := tCylTime;
+		IF xOut3Advance THEN nOut3Step := 230; END_IF
+
+	230:
+		// Jedzie SAM lancuch. Blokada w ACT_ApplyDrives i tak nie
+		// pozwoli rolkom 8 i 10 ruszyc razem z falownikiem 7.
+		sOut3Phase := 'ST.9 lancuch st.8 -> st.10';
+		xFeedRoll08Up := FALSE;
+		xFeedRoll10Up := FALSE;
+		axRunReq[7]   := TRUE;
+		tOut3Step     := tFeed9Chain;
+		IF xOut3Advance THEN nOut3Step := 240; END_IF
+
+	240:
+		sOut3Phase := 'ST.10 rolki ida w gore - paleta jedzie na 14';
+		tOut3Step := tCylTime;
+		IF xOut3Advance THEN nOut3Step := 250; END_IF
+
+	250:
+		sOut3Phase := 'ST.10 -> ST.14 przejazd';
+		axRunReq[16] := TRUE;
+		axRunReq[17] := TRUE;
+		tOut3Step    := tFeed10to14;
+		IF xOut3Advance THEN nOut3Step := 260; END_IF
+
+	260:
+		sOut3Phase := 'ST.14 -> ST.15 przejazd';
+		axRunReq[17] := TRUE;
+		axRunReq[18] := TRUE;
+		tOut3Step    := tFeed14to15;
+		IF xOut3Advance THEN nOut3Step := 270; END_IF
+
+	270:
+		// Jak wyzej: na stacji 16 moze jeszcze lezec paleta,
+		// ktorej operator nie odebral. Nie wpychamy w nia kolejnej.
+		sOut3Phase := 'ST.15 -> ST.16 przejazd, czekam na IN10';
+
+		IF NOT xPal_St16 OR xOut3Armed THEN
+			axRunReq[18] := TRUE;
+			axRunReq[19] := TRUE;
+		END_IF
+
+		IF NOT xPal_St16 THEN xOut3Armed := TRUE; END_IF
+
+		IF xPal_St16 AND NOT xOut3Armed THEN
+			sOut3Phase := 'ST.16 ZAJETA - stoje, czekam az operator odbierze';
+		END_IF
+
+		IF xOut3Armed AND xPal_St16 THEN
+			nFeedPallets := nFeedPallets + 1;
+			nOut3Step    := 275;
+		END_IF
+
+	275:
+		sOut3Phase := 'ST.16 dobieg po IN10';
+		axRunReq[18] := TRUE;
+		axRunReq[19] := TRUE;
+		tOut3Step    := tFeedSt16Stop;
+
+		IF xOut3Advance THEN nOut3Step := 280; END_IF
+
+	280:
+		// Paleta stoi na stacji 16. Odbiera ja operator - gdy
+		// zniknie z czujnika, po tSt16_Clear tor B sie zwalnia
+		// i moze przyjac nastepna palete ze stacji 5.
+		//
+		// Tor B NIE decyduje juz, czy jechac po nastepna palete
+		// - to nalezy do toru A i desztaplarki.
+		sOut3Phase := 'ST.16 paleta odebrana - czekam na oproznienie';
+		tOut3Step  := tSt16_Clear;
+
+		IF xPal_St16 THEN
+			sOut3Phase := 'ST.16 paleta STOI - odbierz ja';
+			tonOut3Step(IN := FALSE);
+		END_IF
+
+		IF NOT xPal_St16 AND xOut3Advance THEN
+			nOut3Step := 0;
+		END_IF
+
+	END_CASE
+
+END_IF
+
+
+// =============================================================
+// ROLKI STACJI 8 W DOLE - ZATRZASK
+// =============================================================
+//
+// Raz opuszczone pod paleta NOK rolki maja tam zostac, az
+// lancuch przewiezie palete na stacje 10. Inaczej kazdy krok,
+// ktory ich nie pisze, podniosl by je z powrotem i paleta
+// podskakiwalaby miedzy rolkami a lancuchem.
+//
+// Zatrzask zdejmujemy NA ZBOCZU wejscia w krok 240 toru B3,
+// czyli w chwili, gdy lancuch dowiozl palete na stacje 10.
+//
+// MUSI to byc zbocze, nie poziom. Warunek poziomowy
+// (nOut3Step >= 240) jest prawdziwy przez CALA dalsza trase
+// az do stacji 16 - a ta regula wykonuje sie PO krokach.
+// Nastepna paleta zapalala wiec zatrzask w kroku 215, a ten
+// warunek gasil go w tym samym cyklu. Rolki schodzily dopiero
+// wtedy, gdy operator zabral palete ze stacji 16 i tor B3
+// wrocil do zera. Tak to wygladalo na maszynie: pierwsza
+// paleta dobrze, kazda nastepna duzo za pozno.
+//
+// Rolek stacji 10 to NIE dotyczy - nimi steruje tor B3.
+
+IF xOut3NewStep AND (nOut3Step = 240) THEN
+	xSt08_RollDown  := FALSE;
+	xSt08_AtStation := FALSE;
+END_IF
+
+// DRUGIE KASOWANIE - siatka bezpieczenstwa.
+//
+// Wjazd nastepnej palety na stacje 8 (krok 210 toru B2) wymaga
+// rolek W GORZE. Gdyby zatrzask z jakiegokolwiek powodu przezyl
+// poprzednia palete, nastepna nie mialaby po czym wjechac i
+// staloby to tak dlugo, az ktos zabierze palete z konca linii.
+//
+// W tym momencie poprzedniej palety nad rolkami juz nie ma -
+// tor B2 nie ruszylby, gdyby stacja 8 byla zajeta.
+
+IF xOut2NewStep AND (nOut2Step = 210) THEN
+	xSt08_RollDown  := FALSE;
+	xSt08_AtStation := FALSE;
+END_IF
+
+// Opuszczenie rolek. Warunek nadrzedny, nie krok - paleta ma
+// siasc na lancuchu tSt08_DropDelay po IN7, obojetne czy tor B2
+// jest jeszcze w dobiegu, czy juz czeka na zwolnienie lancucha.
+
+IF xSt08_PalletNOK AND xSt08_AtStation AND tonSt08Drop.Q THEN
+	xSt08_RollDown := TRUE;
+END_IF
+
+IF xSt08_RollDown THEN
+	xFeedRoll08Up := FALSE;
+END_IF
+
+
+// =============================================================
+// CZY ZADANE NAPEDY MOGA RUSZYC
+// =============================================================
+//
+// Krok mowi, czego oczekuje od czujnikow. Ale jesli naped nie
+// moze ruszyc, paleta nigdy nie dojedzie i fraza o czujniku
+// jest mylaca - wyglada, jakby zawinil czujnik.
+//
+// Szukamy PIERWSZEGO zadanego napedu, ktory nie potwierdza
+// pracy, i nazywamy przyczyne od skutku do zrodla: pozniejsze
+// przypisanie wygrywa, wiec zostaje przyczyna najglebsza.
+
+nFeedBadDrv := 0;
+sFeedDrvWhy := '';
+
+// Przyczyne ustalamy W PETLI, po indeksie i - nigdy po
+// nFeedBadDrv, ktore moze byc zerem. ST nie gwarantuje
+// skrocenia obliczen w AND, wiec zapis axDrvFault[nFeedBadDrv]
+// siegalby poza tablice ARRAY[1..20] przy braku zadan.
+
+FOR i := 1 TO cNumDrives DO
+
+	IF axRunReq[i] AND NOT axDrvRunning[i] AND (nFeedBadDrv = 0) THEN
+
+		nFeedBadDrv := i;
+		sFeedDrvWhy := 'nie potwierdza pracy';
+
+		IF axDrvFault[i] THEN
+			sFeedDrvWhy := 'BLAD - kasuj xCmdResetDrives';
+		END_IF
+
+		IF NOT axDriveEnabled[i] THEN
+			sFeedDrvWhy := 'NIEDOPUSZCZONY w axDriveEnabled';
+		END_IF
+
+	END_IF
+
+END_FOR
+
+
+// Chwilowy brak potwierdzenia to normalny rozbieg, dopiero
+// utrzymujacy sie jest problemem.
+tonFeedDrv(IN := START_FEED AND (nFeedBadDrv > 0), PT := T#2S);
+
+IF START_FEED AND tonFeedDrv.Q THEN
+	sFeedPhase := CONCAT('NAPED ', INT_TO_STRING(nFeedBadDrv));
+	sFeedPhase := CONCAT(sFeedPhase, ' STOI: ');
+	sFeedPhase := CONCAT(sFeedPhase, sFeedDrvWhy);
+END_IF
+
+
+// -------------------------------------------------------------
+// DOCISKI STACJI 4 -> CEWKI, CO CYKL
+// -------------------------------------------------------------
+//
+// Gorne schodza pierwsze, dolne po tSt04_UpToLo, cofaja sie
+// razem. Przepisujemy w kazdym cyklu, zeby nic nie moglo
+// zabrac sterowania zaworem w trakcie jazdy.
+
+IF START_FEED THEN
+	xSt04_UpExt := xFeedPressOn;
+	xSt04_UpRet := NOT xFeedPressOn;
+	xSt04_LoExt := xFeedPressLoOn;
+	xSt04_LoRet := NOT xFeedPressLoOn;
+END_IF
+
+
+// -------------------------------------------------------------
+// ROLKI PODNOSZONE 8 i 10 -> CEWKI, CO CYKL
+// -------------------------------------------------------------
+
+IF START_FEED THEN
+	xSt08_Up   := xFeedRoll08Up;
+	xSt08_Down := NOT xFeedRoll08Up;
+	xSt10_Up   := xFeedRoll10Up;
+	xSt10_Down := NOT xFeedRoll10Up;
+END_IF
+
+
+// -------------------------------------------------------------
+// MECHANIKA STACJI 5 -> CEWKI, CO CYKL
+// -------------------------------------------------------------
+
+IF START_FEED THEN
+
+	xSt05_BlockExt := xFeed05_Block;
+	xSt05_BlockRet := NOT xFeed05_Block;
+
+	xSt05_LiftUp   := xFeed05_Lift;
+	xSt05_LiftDown := NOT xFeed05_Lift;
+
+	xSt05_JawClose := xFeed05_Jaws;
+
+	FOR i := 1 TO 6 DO
+		axSt05_PullUp[i]   := xFeed05_Pull;
+		axSt05_PullDown[i] := NOT xFeed05_Pull;
+	END_FOR
+
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Work" Id="{4a10e006-0000-4000-9000-00000000e006}">
+      <Implementation>
+        <ST><![CDATA[// =============================================================
+// ACT_Work
+// Praca stacji - transportery STOJA
+// =============================================================
+//
+// Kazdy ruch silownika trwa tCylTime. Stacje bez mechaniki
+// przechodza od razu do przejazdu.
+
+CASE nIdx OF
+
+
+// -------------------------------------------------------------
+// 0 - SPROWADZENIE MECHANIKI DO POLOZENIA WYJSCIOWEGO
+// -------------------------------------------------------------
+
+0:
+	sPhase := 'polozenie wyjsciowe mechaniki';
+
+	xSt03_JawClose := FALSE;
+			xSt03_JawOpen  := TRUE;
+	xSt11_JawClose := FALSE;
+			xSt11_JawOpen  := TRUE;
+
+	xSt04_UpExt := FALSE;	xSt04_UpRet := TRUE;
+	xSt04_LoExt := FALSE;	xSt04_LoRet := TRUE;
+
+	xSt05_BlockExt := FALSE;
+			xSt05_BlockRet := TRUE;
+	xSt05_LiftUp   := FALSE;
+			xSt05_LiftDown := TRUE;
+	xSt05_JawClose := FALSE;
+	FOR i := 1 TO 6 DO
+				axSt05_PullUp[i]   := FALSE;
+				axSt05_PullDown[i] := TRUE;
+			END_FOR
+
+	xSt08_Up   := TRUE;
+	xSt08_Down := FALSE;
+	xSt10_Up   := TRUE;
+	xSt10_Down := FALSE;
+
+	IF xAdvance THEN
+		nIdx	:= 1;
+		nSub	:= 0;
+		xMoving	:= FALSE;
+	END_IF
+
+
+// -------------------------------------------------------------
+// 1 - STACJA 1: CZEKAMY NA STOS
+// -------------------------------------------------------------
+//
+// Czujnika IN1 nie uzywamy. Jedziemy dopiero, gdy operator
+// (albo pozniej czujnik) postawi xSt01_StackReady na TRUE.
+// Krok nie ma czasowki - stoi, dopoki bit nie przyjdzie.
+
+1:
+	sPhase := 'st.1 czekam na stos - bit xSt01_StackReady';
+
+	IF xSt01_StackReady THEN
+		sPhase := 'st.1 stos gotowy - jazda';
+		xMoving	:= TRUE;
+		nSub	:= 0;
+	END_IF
+
+
+// -------------------------------------------------------------
+// 3 - DESZTAPLARKA: SAME SZCZEKI
+// -------------------------------------------------------------
+//
+// Wozek stoi - falownik 1 jest zablokowany, mechanika
+// podnoszenia niegotowa. Sprawdzamy tylko zawory szczek.
+
+3:
+	CASE nSub OF
+		0:
+			sPhase := 'st.3 szczeki zamykaja sie';
+			xSt03_JawClose := TRUE;
+			xSt03_JawOpen  := FALSE;
+			IF xAdvance THEN nSub := 10; END_IF
+		10:
+			sPhase := 'st.3 szczeki otwieraja sie';
+			xSt03_JawClose := FALSE;
+			xSt03_JawOpen  := TRUE;
+			IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+	END_CASE
+
+
+// -------------------------------------------------------------
+// 4 - KONIEC TESTU SCISKANIA
+// -------------------------------------------------------------
+//
+// Sam test odbyl sie na JADACEJ palecie, w ACT_MoveSt04. Tutaj
+// paleta juz stoi na koncu stacji, a my tylko pilnujemy, zeby
+// dociski byly cofniete, zanim ruszy dalej.
+
+4:
+	sPhase := 'st.4 test zakonczony - dociski cofniete';
+	xSt04_UpExt := FALSE;	xSt04_UpRet := TRUE;
+	xSt04_LoExt := FALSE;	xSt04_LoRet := TRUE;
+	IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+
+
+// -------------------------------------------------------------
+// 5 - TEST ROZRYWANIA
+// -------------------------------------------------------------
+
+5:
+	CASE nSub OF
+		0:
+			sPhase := 'st.5 blokada wysuwa sie';
+			xSt05_BlockExt := TRUE;
+			xSt05_BlockRet := FALSE;
+			IF xAdvance THEN nSub := 10; END_IF
+		10:
+			sPhase := 'st.5 szczeki ida w gore';
+			xSt05_LiftUp   := TRUE;
+			xSt05_LiftDown := FALSE;
+			IF xAdvance THEN nSub := 20; END_IF
+		20:
+			sPhase := 'st.5 szczeki zamykaja sie';
+			xSt05_JawClose := TRUE;
+			IF xAdvance THEN nSub := 30; END_IF
+		30:
+			sPhase := 'st.5 silowniki rozrywajace ida w gore';
+			FOR i := 1 TO 6 DO
+				axSt05_PullUp[i]   := TRUE;
+				axSt05_PullDown[i] := FALSE;
+			END_FOR
+			IF xAdvance THEN nSub := 40; END_IF
+		40:
+			sPhase := 'st.5 silowniki rozrywajace ida w dol';
+			FOR i := 1 TO 6 DO
+				axSt05_PullUp[i]   := FALSE;
+				axSt05_PullDown[i] := TRUE;
+			END_FOR
+			IF xAdvance THEN nSub := 50; END_IF
+		50:
+			sPhase := 'st.5 szczeki otwieraja sie';
+			xSt05_JawClose := FALSE;
+			IF xAdvance THEN nSub := 60; END_IF
+		60:
+			sPhase := 'st.5 szczeki ida w dol';
+			xSt05_LiftUp   := FALSE;
+			xSt05_LiftDown := TRUE;
+			IF xAdvance THEN nSub := 70; END_IF
+		70:
+			sPhase := 'st.5 blokada opuszcza sie';
+			xSt05_BlockExt := FALSE;
+			xSt05_BlockRet := TRUE;
+			IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+	END_CASE
+
+
+// -------------------------------------------------------------
+// 8 - ROZJAZD, PRZEBIEG DOBRYCH: ROLKI W GORZE
+// -------------------------------------------------------------
+
+8:
+	sPhase := 'st.8 rolki ida w gore - paleta jedzie prosto';
+	xSt08_Up   := TRUE;
+	xSt08_Down := FALSE;
+	IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+
+
+// -------------------------------------------------------------
+// 9 - SZTAPLARKA: SAME SZCZEKI
+// -------------------------------------------------------------
+
+9:
+	CASE nSub OF
+		0:
+			sPhase := 'st.11 szczeki zamykaja sie';
+			xSt11_JawClose := TRUE;
+			xSt11_JawOpen  := FALSE;
+			IF xAdvance THEN nSub := 10; END_IF
+		10:
+			sPhase := 'st.11 szczeki otwieraja sie';
+			xSt11_JawClose := FALSE;
+			xSt11_JawOpen  := TRUE;
+			IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+	END_CASE
+
+
+// -------------------------------------------------------------
+// 11 - WYJSCIE DOBRYCH, KONIEC PRZEBIEGU
+// -------------------------------------------------------------
+
+11:
+	sPhase := 'st.13 odbior - nowa paleta na stacji 8, trasa odrzutu';
+	IF xAdvance THEN
+		nIdx	:= 12;
+		nSub	:= 0;
+		xMoving	:= FALSE;
+	END_IF
+
+
+// -------------------------------------------------------------
+// 12 - ROZJAZD, PRZEBIEG ODRZUTU: OBIE ROLKI W DOLE
+// -------------------------------------------------------------
+//
+// Paleta ma lezec na lancuchu, wiec rolki stacji 8 I 10 musza
+// zejsc, zanim lancuch ruszy.
+
+12:
+	CASE nSub OF
+		0:
+			sPhase := 'st.8 rolki ida w dol';
+			xSt08_Up   := FALSE;
+	xSt08_Down := TRUE;
+			IF xAdvance THEN nSub := 10; END_IF
+		10:
+			sPhase := 'st.10 rolki ida w dol - droga dla lancucha';
+			xSt10_Up   := FALSE;
+	xSt10_Down := TRUE;
+			IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+	END_CASE
+
+
+// -------------------------------------------------------------
+// 13 - PRZEKIEROWANIE: ROLKI W GORE
+// -------------------------------------------------------------
+
+13:
+	sPhase := 'st.10 rolki ida w gore - paleta jedzie na 14';
+	xSt10_Up   := TRUE;
+	xSt10_Down := FALSE;
+	IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+
+
+// -------------------------------------------------------------
+// 16 - ODBIOR ODRZUTU, KONIEC PETLI
+// -------------------------------------------------------------
+
+16:
+	sPhase := 'st.16 odbior - koniec przebiegu';
+	IF xAdvance THEN
+		nIdx	:= 0;
+		nSub	:= 0;
+		xMoving	:= FALSE;
+		nLoops	:= nLoops + 1;
+	END_IF
+
+
+// -------------------------------------------------------------
+// STACJE BEZ MECHANIKI - postoj i jedziemy dalej
+// -------------------------------------------------------------
+
+ELSE
+	sPhase := 'postoj na stacji - brak mechaniki';
+	IF xAdvance THEN xMoving := TRUE; nSub := 0; END_IF
+
+END_CASE
+]]></ST>
+      </Implementation>
+    </Action>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_St04Cfg" Id="{7a1c0030-0000-4000-9000-000000000030}">
+    <Declaration><![CDATA[TYPE ST_St04Cfg :
+STRUCT
+	// =========================================================
+	// STACJA 4 - TEST SCISKANIA, NASTAWY NIEULOTNE
+	// =========================================================
+	//
+	// Test toczy sie na JADACEJ palecie. Rolki dociskowe kreca
+	// sie caly czas, a silowniki napieraja na deski w trakcie
+	// przejazdu. Dlatego przerwanie uniewaznia wynik -
+	// aConv[4].Cfg.xNokOnInterrupt musi byc TRUE.
+
+	// ---------------------------------------------------------
+	// CZUJNIK WSTEPNY
+	// ---------------------------------------------------------
+	//
+	// Czujnik przed stacja, od ktorego liczy sie czas do wysuwu
+	// silownikow. Na dzien pisania kodu jeszcze nie zamontowany.
+	//
+	// xPreSensorInstalled = FALSE: czasowka startuje od chwili
+	// ruszenia palety z poprzedniej stacji (tEntryToUpper).
+	// Po montazu wystarczy przelaczyc bit - kod sie nie zmienia.
+
+	xPreSensorInstalled	: BOOL := FALSE;
+
+	// TRUE = logika odwrocona, tak jak czujniki koncowe
+	// (0 na wejsciu = czujnik cos widzi)
+	xPreSensorInverted	: BOOL := TRUE;
+
+
+	// ---------------------------------------------------------
+	// CZASY SEKWENCJI
+	// ---------------------------------------------------------
+
+	// Od czujnika wstepnego do wysuwu silownikow GORNYCH
+	tPreToUpper			: TIME := T#500MS;
+
+	// To samo, gdy czujnika wstepnego jeszcze nie ma -
+	// liczone od rozpoczecia wjazdu
+	tEntryToUpper		: TIME := T#3S;
+
+	// Od wysuwu gornych do wysuwu DOLNYCH.
+	// Gorne ida pierwsze, zeby dolne nie uniosly palety,
+	// ale odstep ma byc symboliczny - dociski maja isc razem.
+	tUpperToLower		: TIME := T#100MS;
+
+	// Watchdog calej operacji
+	tOpWatchdog			: TIME := T#60S;
+
+
+	// ---------------------------------------------------------
+	// ROLKI DOCISKOWE
+	// ---------------------------------------------------------
+	//
+	// Falownik 3. Rolki na koncach silownikow gornych sa
+	// napedzane, zeby paleta nie utknela pod dociskiem.
+
+	lrRollerFreq		: LREAL := 25.0;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,420 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_CamAxis" Id="{6c1a0001-0000-4000-9000-00000000c001}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_CamAxis
+// =============================================================
+// OS KRZYWKI DESZTAPLARKI I SZTAPLARKI
+// =============================================================
+//
+// Korba na falowniku, enkoder SINGLE TURN, hamulec
+// elektromagnetyczny.
+//
+// -------------------------------------------------------------
+// DLACZEGO POZYCJA NARASTAJACA, A NIE MODULO
+// -------------------------------------------------------------
+// Enkoder daje 0..65535 i przekreca sie przez zero. Poprzednia
+// wersja porownywala pozycje wprost modulo i to bylo zrodlo
+// rozjezdzania sie maszyny:
+//
+//   wozek przejechal cel o 1500 impulsow, nastepny krok kazal
+//   jechac do tego samego albo wczesniejszego punktu, a "droga
+//   do przodu" wychodzila 64036 zamiast zera - czyli CALY
+//   DODATKOWY OBROT. To samo przy kazdym starcie: maszyna stoi
+//   na dole, krok kaze jechac na dol, a modulo mowi "prawie
+//   pelen obrot przed toba".
+//
+// Dlatego surowy enkoder sluzy tu tylko do jednego: policzenia
+// PRZYROSTU ze znakiem, z wykryciem przejscia przez zero. Ten
+// przyrost sumujemy w diAccum - pozycji NARASTAJACEJ, liczonej
+// w impulsach od punktu odniesienia. Na niej porownania sa
+// zwyklym odejmowaniem i nie ma zadnej dwuznacznosci:
+//
+//   diRemain := diTargetAbs - diAccum;
+//
+// Ujemny uchyb znaczy "juz przejechane" i konczy ruch od razu,
+// zamiast wysylac os na dodatkowa petle.
+//
+// Blad dojazdu przenosi sie SAM. Cel 16000, przejechales do
+// 17500 - do celu 24000 zostaje 6500, a nie 8000. Nic nie
+// trzeba korygowac recznie.
+//
+// -------------------------------------------------------------
+// PUNKT ODNIESIENIA
+// -------------------------------------------------------------
+// diAccum rosnie bez konca, wiec raz na cykl nadrzedny ustawia
+// go od nowa przez xSetAccum. Robi sie to na pozycji o ZNANEJ
+// wartosci enkodera (dolnej), podajac uchyb wzgledem niej -
+// wtedy resztka po przejechaniu celu nie ginie, a cykl nigdy
+// nie odplywa od prawdziwego dolu.
+//
+// -------------------------------------------------------------
+// KORBA JEDZIE W JEDNA STRONE
+// -------------------------------------------------------------
+// Cel podaje sie zawsze DO PRZODU wzgledem diAccum. Do tylu os
+// jedzie wylacznie w jezdzie recznej.
+//
+// -------------------------------------------------------------
+// HAMULEC
+// -------------------------------------------------------------
+// Wyjscie TRUE = hamulec ROZLACZONY. Schodzi razem z komenda
+// dla falownika, zaklada sie tBrakeHold po jej zdjeciu. Stan
+// bez zasilania to FALSE, czyli hamulec ZALOZONY.
+VAR_INPUT
+
+	// Surowa pozycja z enkodera - moze byc dowolnie duza,
+	// blok sam sprowadza ja modulo
+	diRawPos		: DINT;
+
+	// Zezwolenie
+	xEnable			: BOOL;
+
+	// Poziom: jedz do diTargetAbs i tam stoj
+	xGoTo			: BOOL;
+
+	// Cel na skali NARASTAJACEJ, w impulsach od punktu
+	// odniesienia. Ma byc stala w obrebie kroku.
+	diTargetAbs		: DINT;
+
+	// Ustawienie punktu odniesienia, na zbocze
+	xSetAccum		: BOOL;
+	diSetAccumTo	: DINT;
+
+	// RECZNA JAZDA - poziom, bez celu. Oba bity naraz = nic.
+	xJogFwd			: BOOL;
+	xJogRev			: BOOL;
+
+	// Potwierdzenie pracy z falownika
+	xDrvRunning		: BOOL;
+
+	// Kasowanie czuwaka, na zbocze
+	xReset			: BOOL;
+
+	// -----------------------------------------------------
+	// NASTAWY
+	// -----------------------------------------------------
+
+	// Wyprzedzenie hamowania - zadanie znika tyle przed celem
+	diStopLead		: DINT := 0;
+
+	// START: wyprzedzenie zdjecia hamulca. ZERO = jednoczesnie.
+	tBrakeReleaseLead	: TIME := T#0S;
+
+	// STOP: ile hamulec czeka po zdjeciu komendy z falownika.
+	// SWIADOMIE krotsze niz rampa hamowania (P103 = 1 s) -
+	// lepiej dolozyc hamulcowi pracy, niz puscic wozek wolno.
+	tBrakeHold		: TIME := T#700MS;
+
+	// Czuwak ruchu
+	tStallGrace		: TIME := T#3S;
+	tStall			: TIME := T#2S;
+	diStallMin		: DINT := 20;
+
+	// Falownik ma potwierdzic prace w tym czasie
+	tDrvAck			: TIME := T#1S500MS;
+
+	// Postoj: brak przyrostu przez tyle = os stoi
+	tRest			: TIME := T#300MS;
+
+END_VAR
+VAR_OUTPUT
+
+	// Enkoder sprowadzony do 0..65535 - do podgladu i do
+	// wyliczania punktu odniesienia
+	diPos			: DINT;
+
+	// POZYCJA NARASTAJACA - na niej pracuje cala reszta
+	diAccum			: DINT;
+
+	// Ile zostalo do celu. UJEMNE = cel przejechany.
+	diRemain		: DINT;
+
+	// Ile ten ruch faktycznie przejechal
+	diMoved			: DINT;
+
+	// Przyrost pozycji w tym cyklu, ze znakiem
+	diStep			: DINT;
+
+	// Przejscia przez zero enkodera
+	diTurns			: DINT;
+
+	// Dojazd po zdjeciu zadania
+	diCoast			: DINT;
+
+	// Cel osiagniety - ZATRZASK do nowego ruchu
+	xInPos			: BOOL;
+
+	// Zadanie dla falownika
+	xRunReq			: BOOL;
+	xRev			: BOOL;
+
+	// Hamulec: TRUE = rozlaczony
+	xBrakeRelease	: BOOL;
+
+	xAtRest			: BOOL;
+	xJogging		: BOOL;
+	xBrakeWait		: BOOL;
+
+	// Zadanie bylo, os nie ruszyla
+	xStall			: BOOL;
+
+	// Falownik nie potwierdzil pracy - problem napedu,
+	// a nie mechaniki
+	xNoDrvAck		: BOOL;
+
+END_VAR
+VAR
+
+	xInit			: BOOL;
+	diPosPrev		: DINT;
+	diTargetPrev	: DINT;
+	diMoveStart		: DINT;
+
+	xDirRev			: BOOL;
+	xNewMove		: BOOL;
+	xMoveWanted		: BOOL;
+	xBrakeOpen		: BOOL;
+	xMoving			: BOOL;
+	xRunPrev		: BOOL;
+
+	diStopAccum		: DINT;
+	xCoasting		: BOOL;
+
+	rtrgGo			: R_TRIG;
+	rtrgReset		: R_TRIG;
+	rtrgSetAccum	: R_TRIG;
+
+	tofBrake		: TOF;
+	tonBrakeOpen	: TON;
+	tonGrace		: TON;
+	tonStall		: TON;
+	tonRest			: TON;
+	tonDrvAck		: TON;
+
+	diStallRef		: DINT;
+	xStallReset		: BOOL;
+	xStallArmed		: BOOL;
+
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// =============================================================
+// ENKODER -> PRZYROST ZE ZNAKIEM
+// =============================================================
+//
+// Surowa wartosc moze byc wieksza niz jeden obrot, wiec
+// sprowadzamy ja modulo. MOD na ujemnej daje w ST wynik ujemny,
+// dlatego domykamy recznie.
+
+diPos := diRawPos MOD 65536;
+
+IF diPos < 0 THEN
+	diPos := diPos + 65536;
+END_IF
+
+
+IF NOT xInit THEN
+	xInit        := TRUE;
+	diPosPrev    := diPos;
+	diStallRef   := diPos;
+	diTargetPrev := diTargetAbs;
+END_IF
+
+
+// Skok wiekszy niz pol obrotu nie jest ruchem - to licznik
+// przekrecil sie przez zero. Prostujemy go i liczymy przejscie.
+
+diStep := diPos - diPosPrev;
+
+IF diStep > 32768 THEN
+	diStep  := diStep - 65536;
+	diTurns := diTurns - 1;
+END_IF
+
+IF diStep < -32768 THEN
+	diStep  := diStep + 65536;
+	diTurns := diTurns + 1;
+END_IF
+
+diPosPrev := diPos;
+
+
+// =============================================================
+// POZYCJA NARASTAJACA
+// =============================================================
+//
+// Tu przestaje istniec problem przekrecania sie enkodera.
+// diAccum jest zwykla liczba impulsow od punktu odniesienia
+// i rosnie miedzy obrotami bez zadnego zawijania.
+
+diAccum := diAccum + diStep;
+
+
+// Punkt odniesienia ustawiany z zewnatrz, raz na cykl
+rtrgSetAccum(CLK := xSetAccum);
+
+IF rtrgSetAccum.Q THEN
+	diAccum     := diSetAccumTo;
+	diMoveStart := diSetAccumTo;
+	xInPos      := TRUE;
+
+	// Pomiar dojazdu musi przejsc przez ten skok sucha stopa.
+	// diCoast liczy sie jako roznica na skali narastajacej,
+	// wiec przestawienie punktu odniesienia bez tego wygladalo
+	// by jak dojazd o caly obrot.
+	diStopAccum := diSetAccumTo;
+	xCoasting   := FALSE;
+END_IF
+
+
+// =============================================================
+// NOWY RUCH
+// =============================================================
+//
+// Nowy ruch to podanie zadania albo zmiana celu. diTargetAbs
+// ma byc STALA w obrebie kroku - inaczej kazdy cykl wygladalby
+// jak nowy ruch.
+
+rtrgGo(CLK := xGoTo AND xEnable);
+
+xNewMove := rtrgGo.Q OR (diTargetAbs <> diTargetPrev);
+diTargetPrev := diTargetAbs;
+
+IF xNewMove THEN
+	diMoveStart := diAccum;
+	xInPos      := FALSE;
+	diStallRef  := diPos;
+END_IF
+
+
+// =============================================================
+// UCHYB I KONIEC RUCHU
+// =============================================================
+//
+// Zwykle odejmowanie, bez modulo. Uchyb ujemny znaczy "cel juz
+// przejechany" i konczy ruch NATYCHMIAST - to jest dokladnie
+// ten przypadek, w ktorym stara wersja wysylala os na dodatkowy
+// pelen obrot.
+//
+// xInPos jest zatrzaskiem: osuniecie sie wozka po zacisnieciu
+// hamulca nie ma prawa odwolac zaliczonego kroku.
+
+diRemain := diTargetAbs - diAccum;
+diMoved  := diAccum - diMoveStart;
+
+IF diRemain <= diStopLead THEN
+	xInPos := TRUE;
+END_IF
+
+
+// =============================================================
+// RUCH I HAMULEC
+// =============================================================
+//
+// Hamulec idzie za ZADANIEM ruchu, falownik dostaje komende
+// tBrakeReleaseLead pozniej. Przy zerze - jednoczesnie.
+
+xJogging := xEnable AND (xJogFwd XOR xJogRev);
+
+xMoveWanted := xEnable AND NOT xStall AND (xJogging OR (xGoTo AND NOT xInPos));
+
+// W cyklu korba jedzie WYLACZNIE do przodu. Kierunek wymuszamy
+// co cykl, zeby ten z jazdy recznej w tyl nie mogl przezyc.
+xDirRev := FALSE;
+
+IF xJogging THEN
+	xDirRev := xJogRev;
+END_IF
+
+
+tofBrake(IN := xMoveWanted, PT := tBrakeHold);
+xBrakeRelease := tofBrake.Q;
+
+tonBrakeOpen(IN := xMoveWanted AND xBrakeRelease, PT := tBrakeReleaseLead);
+
+// Warunek na zero jawny - nie opieramy sie na tym, jak TON
+// zachowa sie przy PT = 0. Blad w te strone dalby os, ktora
+// nigdy nie rusza, i nic by tego nie powiedzialo.
+xBrakeOpen := tonBrakeOpen.Q OR (tBrakeReleaseLead = T#0S);
+
+xBrakeWait := xMoveWanted AND NOT xBrakeOpen;
+
+xMoving := xMoveWanted AND xBrakeRelease AND xBrakeOpen;
+
+xRunReq := xMoving;
+xRev    := xDirRev;
+
+
+// =============================================================
+// POMIAR DOJAZDU
+// =============================================================
+
+IF xRunPrev AND NOT xRunReq THEN
+	diStopAccum := diAccum;
+	xCoasting   := TRUE;
+END_IF
+
+xRunPrev := xRunReq;
+
+IF xCoasting THEN
+	diCoast := diAccum - diStopAccum;
+END_IF
+
+tonRest(IN := ABS(diStep) < diStallMin, PT := tRest);
+xAtRest := tonRest.Q;
+
+IF xAtRest THEN
+	xCoasting := FALSE;
+END_IF
+
+
+// =============================================================
+// CZUWAK RUCHU
+// =============================================================
+//
+// Uzbrojony dopiero po tStallGrace od startu - hamulec musi
+// odpuscic, a silnik rozbiec sie rampa.
+
+tonGrace(IN := xRunReq, PT := tStallGrace);
+xStallArmed := tonGrace.Q;
+
+xStallReset := (ABS(diAccum - diStallRef) > diStallMin)
+               OR NOT xStallArmed OR xNewMove;
+
+IF xStallReset THEN
+	diStallRef := diAccum;
+END_IF
+
+tonStall(IN := xStallArmed AND NOT xStallReset, PT := tStall);
+
+IF tonStall.Q THEN
+	xStall := TRUE;
+END_IF
+
+
+// -------------------------------------------------------------
+// POTWIERDZENIE PRACY Z FALOWNIKA
+// -------------------------------------------------------------
+//
+// Osobny, szybszy czuwak. Zadanie poszlo, hamulec zdjety,
+// a falownik nie melduje pracy - nic nie trzyma wozka i nie ma
+// na co czekac pelnych pieciu sekund.
+
+tonDrvAck(IN := xRunReq AND NOT xDrvRunning, PT := tDrvAck);
+
+IF tonDrvAck.Q THEN
+	xNoDrvAck := TRUE;
+	xStall    := TRUE;
+END_IF
+
+
+rtrgReset(CLK := xReset);
+
+IF rtrgReset.Q OR NOT xEnable THEN
+	xStall     := FALSE;
+	xNoDrvAck  := FALSE;
+	diStallRef := diAccum;
+END_IF
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

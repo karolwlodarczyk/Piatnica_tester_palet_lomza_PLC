@@ -1,0 +1,1 @@
+{"project":{"name":"Ponowne_skanowanie","platform":"TwinCAT RT (x64)","created":"2026-11-18T17:05:32"},"components":[{"name":"TcIo","type":1},{"name":"TcIoECat","type":1},{"name":"TcIoEth","type":1},{"name":"TcPlc30","type":1},{"name":"TcRTime","type":1},{"name":"TcRtsObjects","type":1}],"references":[],"sub_projects":[{"name":"TC3_Tester_Palet","file":"Plc/Port_851.json"}]}

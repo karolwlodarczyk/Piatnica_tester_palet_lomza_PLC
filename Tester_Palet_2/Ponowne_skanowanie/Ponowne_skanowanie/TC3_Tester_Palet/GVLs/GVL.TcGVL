@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <GVL Name="GVL" Id="{11812917-a3d5-4fde-9868-0d0921f86018}">
+    <Declaration><![CDATA[VAR_GLOBAL
+	
+	NORD_DRIVE_IN AT %I* : ARRAY[1..20] OF ST_NordSK550P_In;
+	NORD_DRIVE_OUT AT %Q* : ARRAY[1..20] OF ST_NordSK550P_Out;
+	IO_Destaker_Act_Pos 	AT %I* : DINT;
+	IO_Staker_Act_Pos 	AT %I* : DINT;
+	
+	FestoValves_1  AT %Q* : ARRAY[1..8, 1..2] OF BOOL;
+	FestoValves_2  AT %Q* : ARRAY[1..8, 1..2] OF BOOL;
+	
+	
+	INPUTS AT  %I* : ARRAY[1..300] OF BOOL;
+	OUTPUTS AT  %Q* : ARRAY[1..300] OF BOOL;
+	
+	
+	
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>
